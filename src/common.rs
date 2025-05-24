@@ -32,3 +32,5 @@ impl LayerNorm {
         todo!("Implement LayerNorm forward pass");
     }
 }
+
+pub type ModelKVCache = Vec<Vec<f32>>;
