@@ -96,187 +96,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_config = GPT2Config::load(model_config_path)
         .expect("Failed to load model config for token generation loop");
     
-    let mut model = crate::model::GPT2Model::new(&model_config)
-        .expect("Failed to create a GPT2Model instance for main execution");
+    // Re-use model_config and model from GPT2Config loading test.
+    // Ensure model is mutable for run_repl_loop.
+    let mut model = crate::model::GPT2Model::new(&gpt2_config) // Use gpt2_config loaded earlier
+        .expect("Failed to create a GPT2Model instance for REPL execution");
 
-    println!("\n--- Starting Token Generation (from main) ---");
-    match generate_tokens_fn(
-        &mut model, 
-        &model_config, 
-        initial_prompt_tokens_main.clone(), 
-        max_new_tokens_main, 
-        EOS_TOKEN_ID_MAIN, 
-        theta_hat_main
-    ) {
-        Ok(generated_ids) => {
-            println!("Generated token IDs (from main): {:?}", generated_ids);
-            // Optional: Decode and print the full generated sequence
-            // let final_text = tokenizer.decode(&generated_ids, true)?;
-            // println!("Final generated text (from main): {}", final_text);
-        }
-        Err(e) => {
-            eprintln!("Token generation failed (from main): {}", e);
-        }
+    // --- REPL Setup ---
+    println!("\n--- Starting Interactive REPL ---");
+    // Import REPL functions
+    use rust_transformers_gpt2::repl::{run_repl_loop, get_user_prompt};
+
+    // Get initial prompt from user
+    let prompt_string = get_user_prompt();
+    if prompt_string.is_empty() {
+        println!("Prompt is empty. Exiting REPL.");
+        return Ok(());
     }
-    println!("--- Token Generation (from main) Ended ---");
+
+    // Tokenize the prompt
+    let initial_prompt_tokens_repl = tokenizer.encode(&prompt_string, true)
+        .map_err(|e| format!("Failed to encode prompt string: {}", e))?;
+    
+    if initial_prompt_tokens_repl.is_empty() {
+        println!("Tokenized prompt is empty (e.g. input was only special tokens not kept). Exiting REPL.");
+        return Ok(());
+    }
+
+    // REPL parameters
+    let max_new_tokens_repl = 10; // Max tokens to generate in one REPL session
+    let initial_theta_hat_repl = 0.2f32; // Initial theta_hat value
+    let eos_token_id_repl = gpt2_config.eos_token_id.unwrap_or(50256); // Use EOS from config or default
+
+    // Call the REPL loop
+    if let Err(e) = run_repl_loop(
+        &mut model,
+        &gpt2_config, // Use gpt2_config loaded earlier
+        &tokenizer,
+        initial_prompt_tokens_repl,
+        max_new_tokens_repl,
+        initial_theta_hat_repl,
+        eos_token_id_repl,
+    ) {
+        eprintln!("REPL loop exited with error: {}", e);
+    }
+    
+    println!("--- REPL Ended ---");
 
     Ok(())
 }
 
-// Extracted Token Generation Logic
+// Extracted Token Generation Logic (generate_tokens_fn) - Commented out as REPL is primary now
+/*
 use crate::common::ModelKVCache;
 use crate::model::GPT2Model;
-use ndarray::Array2; // For Array2
+use ndarray::Array2; 
 
 pub fn generate_tokens_fn(
-    model: &mut GPT2Model,
-    model_config: &GPT2Config, // Pass config for vocab_size, n_layer
-    initial_prompt_tokens: Vec<u32>,
-    max_new_tokens: usize,
-    eos_token_id: u32,
-    theta_hat: f32,
+    // ... (implementation was here) ...
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let mut current_token_ids = initial_prompt_tokens.clone();
-    let mut model_cache: ModelKVCache = vec![Vec::new(); model_config.n_layer as usize];
-
-    println!("Initial tokens (fn): {:?}", current_token_ids);
-
-    for i in 0..max_new_tokens {
-        let tokens_for_model_vec = if i == 0 {
-            current_token_ids.clone()
-        } else {
-            vec![*current_token_ids.last().unwrap()]
-        };
-
-        // Convert Vec<u32> to Array2<i32> for model.forward
-        // Assuming batch_size = 1 for generation.
-        // Model expects i32, so cast u32 to i32. This might lose info if token IDs are > i32::MAX.
-        let tokens_for_model_arr: Vec<i32> = tokens_for_model_vec.iter().map(|&x| x as i32).collect();
-        let input_array = Array2::from_shape_vec((1, tokens_for_model_arr.len()), tokens_for_model_arr)?;
-        
-        println!("Iteration {} (fn): Tokens for model (shape {:?}): {:?}", i, input_array.dim(), tokens_for_model_vec);
-
-        let model_output = model.forward(&input_array, &mut model_cache, theta_hat)
-            .map_err(|e| format!("Model forward pass failed: {}", e))?; // More specific error mapping
-
-        // Placeholder for logit extraction from model_output (ArrayD<f32>)
-        // Assuming model_output is [batch_size, seq_len, vocab_size]
-        // We need the logits for the last token: output.slice(s![0, -1, ..])
-        // For now, using dummy logits as before.
-        let vocab_size = model_config.vocab_size as usize;
-        
-        // This is a placeholder. In reality, you'd get this from model_output.
-        // e.g. by taking the slice corresponding to the last token's logits.
-        // let last_token_logits_view = model_output.slice(s![0, -1, ..]);
-        // let logits: Vec<f32> = last_token_logits_view.to_vec();
-        // For testing, if model_output is just hidden states, its last dim might not be vocab_size.
-        // The dummy logits ensure the loop runs.
-        let logits: Vec<f32> = (0..vocab_size).map(|idx| idx as f32).collect();
-
-
-        if logits.is_empty() { // Should not happen with dummy logits
-            return Err("Logits vector was empty.".into());
-        }
-
-        let next_token_id = logits.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)) // Handle NaN safely
-            .map(|(idx, _)| idx as u32)
-            .ok_or("Failed to determine next token from logits.")?; // Handle case where max_by returns None
-
-        println!("Iteration {} (fn): Next token ID: {}", i, next_token_id);
-
-        if next_token_id == eos_token_id {
-            println!("EOS token encountered (fn). Stopping generation.");
-            break;
-        }
-        current_token_ids.push(next_token_id);
-    }
-
-    println!("Generated token IDs (fn): {:?}", current_token_ids);
-    Ok(current_token_ids)
+    // ... (implementation was here) ...
+    unimplemented!("generate_tokens_fn is currently commented out in favor of REPL loop.");
 }
-
+*/
 
 #[cfg(test)]
 mod tests {
-    use super::*; // To import generate_tokens_fn
+    // Comment out the test for the old generate_tokens_fn
+    /*
+    use super::*; 
     use crate::config::GPT2Config;
     use crate::model::GPT2Model;
-    // ModelKVCache is not directly used by the test function itself, but by generate_tokens_fn
 
     #[test]
     fn test_token_generation_loop_basic() {
-        // 1. Setup configuration
-        // Using a default config or loading a minimal one.
-        // For this test, many specific config values don't matter as the model.forward() is a placeholder.
-        let config = GPT2Config {
-            vocab_size: 50257, // Standard for GPT-2
-            n_layer: 2,        // Minimal number of layers
-            n_head: 2,         // Minimal number of heads
-            n_embd: 128,       // Minimal embedding size
-            n_positions: 1024, // Max sequence length
-            n_ctx: 1024,
-            block_size: 1024,  // Often same as n_positions/n_ctx
-            embd_pdrop: 0.1,
-            resid_pdrop: 0.1,
-            attn_pdrop: 0.1,
-            layer_norm_epsilon: 1e-5,
-            initializer_range: 0.02,
-            n_inner: None,     // Will default in MLP::new if needed
-            activation_function: "gelu_new".to_string(), // Example
-            bos_token_id: Some(50256),
-            eos_token_id: Some(50256),
-            scale_attn_weights: true,
-            scale_attn_by_inverse_layer_idx: false,
-            reorder_and_upcast_attn: false,
-            // Add other fields if GPT2Model::new or its components require them
-            // For instance, if there are new fields not covered by a simple default.
-        };
-
-        // 2. Create a dummy model
-        let mut model = GPT2Model::new(&config).expect("Failed to create dummy GPT2Model for test.");
-
-        // 3. Define test parameters
-        let initial_tokens: Vec<u32> = vec![0]; // E.g., BOS token
-        let num_new_tokens_to_generate = 5;
-        let test_eos_token_id = 50256; // Standard EOS token ID
-        let test_theta_hat = 0.0f32;   // Placeholder temperature
-
-        // 4. Call the token generation function
-        let result = generate_tokens_fn(
-            &mut model,
-            &config, // Pass the config
-            initial_tokens.clone(),
-            num_new_tokens_to_generate,
-            test_eos_token_id,
-            test_theta_hat,
-        );
-
-        // 5. Assertions
-        assert!(result.is_ok(), "Token generation failed: {:?}", result.err());
-        let generated_ids = result.unwrap();
-
-        // Check that some tokens were generated.
-        // If no EOS is hit, it should generate initial_tokens.len() + num_new_tokens_to_generate tokens.
-        // If EOS is hit early, it could be less.
-        // A basic check: at least the initial tokens should be there.
-        assert!(!generated_ids.is_empty(), "Generated token IDs vector should not be empty.");
-        assert!(generated_ids.len() >= initial_tokens.len(), "Generated IDs should be at least as long as initial tokens.");
-
-        // If max_new_tokens > 0 and the first generated token is not EOS, 
-        // then more than initial_tokens.len() should be present.
-        if num_new_tokens_to_generate > 0 {
-            // This assertion might be too strict if EOS is generated as the first token.
-            // However, with dummy logits (0..vocab_size), token 0 is always picked.
-            // If test_eos_token_id is 0, it will stop immediately.
-            if test_eos_token_id != 0 || initial_tokens.contains(&0) { // if 0 is not EOS or already in prompt
-                 assert!(generated_ids.len() > initial_tokens.len(), "Should generate new tokens if max_new_tokens > 0 and EOS is not immediately hit.");
-                 assert_eq!(generated_ids.len(), initial_tokens.len() + num_new_tokens_to_generate, "Expected to generate all requested tokens as EOS is not 0.");
-            } else if test_eos_token_id == 0 { // EOS is 0, so it stops after 0 tokens.
-                 assert_eq!(generated_ids.len(), initial_tokens.len(), "Should not generate new tokens if EOS is 0 and generated first.");
-            }
-        }
-        println!("Test test_token_generation_loop_basic completed successfully.");
+        // ... (test implementation was here) ...
     }
+    */
 }
