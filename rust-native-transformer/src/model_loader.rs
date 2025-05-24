@@ -30,6 +30,31 @@ pub enum ModelLoaderError {
     TensorNotFound(String), // Though not strictly used if we iterate through header
 }
 
+impl std::fmt::Display for ModelLoaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelLoaderError::IoError(e) => write!(f, "IO error: {}", e),
+            ModelLoaderError::JsonError(e) => write!(f, "JSON parsing error: {}", e),
+            ModelLoaderError::UnsupportedDtype(s) => write!(f, "Unsupported dtype: {}", s),
+            ModelLoaderError::DataCorruption(s) => write!(f, "Data corruption: {}", s),
+            ModelLoaderError::HeaderTooShort => write!(f, "Header is too short"),
+            ModelLoaderError::InvalidHeaderLength => write!(f, "Invalid header length (e.g., zero)"),
+            ModelLoaderError::TensorNotFound(s) => write!(f, "Tensor not found: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for ModelLoaderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ModelLoaderError::IoError(ref e) => Some(e),
+            ModelLoaderError::JsonError(ref e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+
 impl From<io::Error> for ModelLoaderError {
     fn from(err: io::Error) -> ModelLoaderError {
         ModelLoaderError::IoError(err)
@@ -119,7 +144,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
-    use crate::tensor_engine::TensorError; // For checking tensor creation errors
+    // Removed: use crate::tensor_engine::TensorError; 
 
     // Helper to create a dummy .safetensors file in memory (as Vec<u8>)
     fn create_dummy_safetensors_bytes(

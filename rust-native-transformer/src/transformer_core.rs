@@ -14,6 +14,27 @@ pub enum TransformerError {
     UnsupportedOperation(String), // For features like KV caching if not implemented
 }
 
+impl std::fmt::Display for TransformerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransformerError::TensorError(e) => write!(f, "Tensor error: {:?}", e), // Use {:?} if TensorError's Display is not detailed enough
+            TransformerError::WeightNotFound(s) => write!(f, "Weight not found: {}", s),
+            TransformerError::InvalidWeightShape(s) => write!(f, "Invalid weight shape: {}", s),
+            TransformerError::ConfigError(s) => write!(f, "Configuration error: {}", s),
+            TransformerError::UnsupportedOperation(s) => write!(f, "Unsupported operation: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for TransformerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TransformerError::TensorError(ref e) => Some(e), // Assuming TensorError implements std::error::Error
+            _ => None,
+        }
+    }
+}
+
 impl From<TensorError> for TransformerError {
     fn from(err: TensorError) -> TransformerError {
         TransformerError::TensorError(err)
@@ -147,7 +168,8 @@ pub(crate) mod tensor_ops {
         } else if out_shape.is_empty() { // True scalar input, not valid for matmul against [Din, Dout]
             return Err(TransformerError::TensorError(TensorError::InvalidDimension("Scalar input not directly usable in linear layer without proper shape".to_string())));
         }
-        out_shape[out_shape.len() - 1] = dout;
+        let last_dim_idx = out_shape.len() - 1;
+        out_shape[last_dim_idx] = dout;
         
         let original_rank = input.rank();
         let input_reshaped = if original_rank > 2 {
@@ -417,7 +439,7 @@ impl Block {
 
 // 6. GPT2Model Module
 pub struct GPT2Model {
-    config: Arc<Config>,
+    pub config: Arc<Config>, // Made public
     wte: Tensor<f32>,    
     wpe: Tensor<f32>,    
     blocks: Vec<Block>,
