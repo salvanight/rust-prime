@@ -17,7 +17,7 @@ pub enum TransformerError {
 impl std::fmt::Display for TransformerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransformerError::TensorError(e) => write!(f, "Tensor error: {:?}", e), // Use {:?} if TensorError's Display is not detailed enough
+            TransformerError::TensorError(e) => write!(f, "Tensor error: {:?}", e),
             TransformerError::WeightNotFound(s) => write!(f, "Weight not found: {}", s),
             TransformerError::InvalidWeightShape(s) => write!(f, "Invalid weight shape: {}", s),
             TransformerError::ConfigError(s) => write!(f, "Configuration error: {}", s),
@@ -29,7 +29,7 @@ impl std::fmt::Display for TransformerError {
 impl std::error::Error for TransformerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            TransformerError::TensorError(ref e) => Some(e), // Assuming TensorError implements std::error::Error
+            TransformerError::TensorError(ref e) => Some(e), 
             _ => None,
         }
     }
@@ -44,43 +44,34 @@ impl From<TensorError> for TransformerError {
 // 1. Config Struct
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub n_layer: usize,    // Number of transformer blocks
-    pub n_head: usize,     // Number of attention heads
-    pub n_embd: usize,     // Embedding dimension
-    pub vocab_size: usize, // Vocabulary size
-    pub block_size: usize, // Maximum sequence length (context window)
-    pub bias: bool, // GPT-2 typically has biases in its linear layers
-    // Add other parameters as they become necessary, e.g., epsilon for LayerNorm if not hardcoded
+    pub n_layer: usize,    
+    pub n_head: usize,     
+    pub n_embd: usize,     
+    pub vocab_size: usize, 
+    pub block_size: usize, 
+    pub bias: bool, 
 }
 
 impl Config {
-    // head_dim is frequently used
     pub fn head_dim(&self) -> usize {
-        if self.n_embd == 0 || self.n_head == 0 { // Prevent division by zero if config is bad
+        if self.n_embd == 0 || self.n_head == 0 { 
             return 0;
         }
         if self.n_embd % self.n_head != 0 {
-            // This should ideally be caught at Config creation if possible
-            // For now, panic or return error. Let's assume it's valid for now.
-            // A real application should validate Config thoroughly.
-            // Defaulting to integer division, but an error/panic is better in real code.
             eprintln!("Warning: n_embd {} is not divisible by n_head {}. Head dimension may be incorrect.", self.n_embd, self.n_head);
         }
         self.n_embd / self.n_head
     }
 }
 
-
-// Placeholder for tensor operations that would ideally be in tensor_engine.rs
-// These are simplified stubs or direct calls to existing tensor_engine functions.
-// The purpose is to make transformer_core.rs compilable and illustrate logic.
-// TODO: Move robust implementations of these to tensor_engine.rs
 #[allow(dead_code)]
 pub(crate) mod tensor_ops {
     use super::*;
 
+    // matmul is now primarily called as a method: a.matmul_simd(b)
+    // This static version can be kept for compatibility or removed if not used.
     pub fn matmul(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
-        Tensor::matmul(a, b) 
+        a.matmul_simd(b) // Defaulting to SIMD version
     }
 
     pub fn softmax(a: &Tensor<f32>, axis: usize) -> Result<Tensor<f32>, TensorError> {
@@ -91,13 +82,14 @@ pub(crate) mod tensor_ops {
         a.layernorm(gamma, beta, epsilon)
     }
 
+    // gelu is now primarily called as a method: a.gelu_simd()
+    // This static version can be kept for compatibility or removed if not used.
     pub fn gelu(a: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
-        a.gelu()
+        a.gelu_simd() // Defaulting to SIMD version
     }
     
     pub fn add(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
         if a.shape != b.shape {
-            // Attempt broadcasting for b if it's a 1D bias matching the last dim of a
             if b.rank() == 1 && a.shape.last() == b.shape.last() && a.rank() > 1 {
                 let mut out_data = a.data.clone();
                 let last_dim_size = b.shape[0];
@@ -118,7 +110,6 @@ pub(crate) mod tensor_ops {
         Tensor::new(data, a.shape.clone())
     }
     
-    // A more robust split for QKV. Splits the last dimension into `num_chunks`.
     pub fn split_last_dim(tensor: &Tensor<f32>, num_chunks: usize) -> Result<Vec<Tensor<f32>>, TensorError> {
         if tensor.rank() == 0 {
             return Err(TensorError::InvalidDimension("Cannot split scalar tensor".to_string()));
@@ -163,9 +154,9 @@ pub(crate) mod tensor_ops {
         }
 
         let mut out_shape = input.shape.clone();
-        if out_shape.is_empty() && input.num_elements() == din { // Handle scalar input that is actually a vector for matmul
-             out_shape = vec![1, din]; // Treat as [1, Din]
-        } else if out_shape.is_empty() { // True scalar input, not valid for matmul against [Din, Dout]
+        if out_shape.is_empty() && input.num_elements() == din { 
+             out_shape = vec![1, din]; 
+        } else if out_shape.is_empty() { 
             return Err(TransformerError::TensorError(TensorError::InvalidDimension("Scalar input not directly usable in linear layer without proper shape".to_string())));
         }
         let last_dim_idx = out_shape.len() - 1;
@@ -175,20 +166,19 @@ pub(crate) mod tensor_ops {
         let input_reshaped = if original_rank > 2 {
             let new_rows: usize = input.shape[..original_rank-1].iter().product();
             input.reshape(vec![new_rows, din])?
-        } else if original_rank == 1 && input.shape[0] == din { // e.g. input [Din]
+        } else if original_rank == 1 && input.shape[0] == din { 
             input.reshape(vec![1, din])? 
         }
          else {
             input.clone() 
         };
 
-        let mut output = Tensor::matmul(&input_reshaped, weight)?;
+        let mut output = input_reshaped.matmul_simd(weight)?; // Using matmul_simd
 
         if let Some(b) = bias {
             if b.rank() != 1 || b.shape[0] != dout {
                  return Err(TransformerError::TensorError(TensorError::IncompatibleShapes(format!("Bias shape {:?} incompatible with output dim {}", b.shape, dout))));
             }
-            // Add bias (broadcasting over output rows)
             for r in 0..output.shape[0] { 
                 for c in 0..output.shape[1] { 
                     let flat_idx = r * output.shape[1] + c;
@@ -197,7 +187,7 @@ pub(crate) mod tensor_ops {
             }
         }
         
-        if original_rank > 2 || (original_rank == 1 && input.shape[0] == din) { // Reshape back if we changed it
+        if original_rank > 2 || (original_rank == 1 && input.shape[0] == din) { 
             output = output.reshape(out_shape)?;
         }
         Ok(output)
@@ -228,8 +218,6 @@ pub(crate) mod tensor_ops {
     }
 }
 
-
-// 3. MultiHeadAttention Module
 pub struct MultiHeadAttention {
     c_attn_w: Tensor<f32>, 
     c_attn_b: Tensor<f32>, 
@@ -297,22 +285,19 @@ impl MultiHeadAttention {
 
         for b_idx in 0..batch_size {
             for h_idx in 0..n_head {
-                let q_slice = q.slice_mha(b_idx, h_idx)?; // [S, D]
-                let k_t_slice = k_t.slice_mha(b_idx, h_idx)?; // [D, S]
+                let q_slice = q.slice_mha(b_idx, h_idx)?; 
+                let k_t_slice = k_t.slice_mha(b_idx, h_idx)?; 
                 
-                let mut scores_s = tensor_ops::matmul(&q_slice, &k_t_slice)?;
+                let mut scores_s = q_slice.matmul_simd(&k_t_slice)?; // Using matmul_simd
                 for val in scores_s.data.iter_mut() {
                     *val /= scale;
                 }
                 att_scores_parts.push(scores_s);
             }
         }
-        // Combine att_scores_parts into one tensor [B, H, S, S]
-        // This is complex. For now, assume data is collected and reshaped.
         let mut att_scores_data_flat = Vec::new();
         for t in att_scores_parts { att_scores_data_flat.extend(t.data); }
         let mut att_scores = Tensor::new(att_scores_data_flat, vec![batch_size, n_head, seq_len, seq_len])?;
-
 
         if let Some(m) = mask { 
             for b in 0..batch_size {
@@ -334,9 +319,9 @@ impl MultiHeadAttention {
         let mut out_att_parts = Vec::with_capacity(batch_size * n_head);
         for b_idx in 0..batch_size {
             for h_idx in 0..n_head {
-                let probs_slice = att_probs.slice_mha(b_idx, h_idx)?; // [S,S]
-                let v_slice = v.slice_mha(b_idx, h_idx)?; // [S,D]
-                out_att_parts.push(tensor_ops::matmul(&probs_slice, &v_slice)?);
+                let probs_slice = att_probs.slice_mha(b_idx, h_idx)?; 
+                let v_slice = v.slice_mha(b_idx, h_idx)?; 
+                out_att_parts.push(probs_slice.matmul_simd(&v_slice)?); // Using matmul_simd
             }
         }
         let mut out_att_data_flat = Vec::new();
@@ -352,7 +337,6 @@ impl MultiHeadAttention {
     }
 }
 
-// 4. FeedForward Module (MLP)
 pub struct FeedForward {
     c_fc_w: Tensor<f32>,   
     c_fc_b: Tensor<f32>,   
@@ -389,13 +373,12 @@ impl FeedForward {
 
     pub fn forward(&self, x: &Tensor<f32>) -> Result<Tensor<f32>, TransformerError> {
         let mut h = tensor_ops::linear(x, &self.c_fc_w, Some(&self.c_fc_b))?;
-        h = tensor_ops::gelu(&h)?;
+        h = h.gelu_simd()?; // Using gelu_simd
         let output = tensor_ops::linear(&h, &self.c_proj_w, Some(&self.c_proj_b))?;
         Ok(output)
     }
 }
 
-// 5. Block Module (Transformer Layer)
 pub struct Block {
     attn: MultiHeadAttention,
     mlp: FeedForward,
@@ -437,9 +420,8 @@ impl Block {
     }
 }
 
-// 6. GPT2Model Module
 pub struct GPT2Model {
-    pub config: Arc<Config>, // Made public
+    pub config: Arc<Config>, 
     wte: Tensor<f32>,    
     wpe: Tensor<f32>,    
     blocks: Vec<Block>,
@@ -449,7 +431,7 @@ pub struct GPT2Model {
 
 impl GPT2Model {
     fn get_weight(weights: &mut HashMap<String, Tensor<f32>>, name: &str, expected_shape: Option<&[usize]>) -> Result<Tensor<f32>, TransformerError> {
-        let weight_name = name.to_string(); // Ensure owned string for map key if needed
+        let weight_name = name.to_string(); 
         let weight = weights.remove(&weight_name).ok_or_else(|| TransformerError::WeightNotFound(name.to_string()))?;
         if let Some(shape) = expected_shape {
             if weight.shape != shape {
@@ -524,16 +506,11 @@ impl GPT2Model {
 
         let token_embed = tensor_ops::embedding(token_ids, &self.wte)?; 
         
-        // Create positional IDs tensor [seq_len]
         let pos_ids_data: Vec<u32> = (0..seq_len as u32).collect();
         let pos_ids_tensor = Tensor::new(pos_ids_data, vec![seq_len])?;
         
-        // Get positional embeddings for current sequence length
-        let pos_embed_full = tensor_ops::embedding(&pos_ids_tensor, &self.wpe)?; // [seq_len, n_embd]
+        let pos_embed_full = tensor_ops::embedding(&pos_ids_tensor, &self.wpe)?; 
 
-        // Add token and positional embeddings (broadcasting pos_embed_full to batch)
-        // This requires pos_embed_full to be [1, seq_len, n_embd] for broadcasting, or manual batch addition.
-        // Let's expand pos_embed_full and then add.
         let pos_embed_batched_data = pos_embed_full.data.repeat(token_ids.shape[0]);
         let pos_embed_batched = Tensor::new(pos_embed_batched_data, token_embed.shape.clone())?;
 
@@ -555,7 +532,6 @@ impl GPT2Model {
 
         x = tensor_ops::layernorm(&x, &self.ln_f_g, &self.ln_f_b, 1e-5)?;
         
-        // Transpose wte: [VocabSize, EmbDim] -> [EmbDim, VocabSize]
         let wte_t_data = Tensor::<f32>::transpose_data_generic(&self.wte.data, self.wte.shape[0], self.wte.shape[1]);
         let wte_t = Tensor::new(wte_t_data, vec![self.config.n_embd, self.config.vocab_size])?;
         
@@ -565,18 +541,14 @@ impl GPT2Model {
     }
 }
 
-// Tensor extensions (placeholders for tensor_engine.rs)
-// These are simplified / specific-case implementations.
-// TODO: Move robust general versions to tensor_engine.rs
 trait TensorExtMHA {
-    fn permute_mha_qkv(&self) -> Result<Tensor<f32>, TransformerError>;      // [B,S,H,D] -> [B,H,S,D]
-    fn permute_mha_kt(&self) -> Result<Tensor<f32>, TransformerError>;       // [B,H,S,D] -> [B,H,D,S] (for K_T)
-    fn permute_mha_output(&self) -> Result<Tensor<f32>, TransformerError>;  // [B,H,S,D] -> [B,S,H,D] (for output)
-    fn slice_mha(&self, batch_idx: usize, head_idx: usize) -> Result<Tensor<f32>, TransformerError>; // Extracts [S,D] or [S,S] slice
+    fn permute_mha_qkv(&self) -> Result<Tensor<f32>, TransformerError>;      
+    fn permute_mha_kt(&self) -> Result<Tensor<f32>, TransformerError>;       
+    fn permute_mha_output(&self) -> Result<Tensor<f32>, TransformerError>;  
+    fn slice_mha(&self, batch_idx: usize, head_idx: usize) -> Result<Tensor<f32>, TransformerError>; 
 }
 
 impl TensorExtMHA for Tensor<f32> {
-    // Input: [B, S, H, D], Output: [B, H, S, D]
     fn permute_mha_qkv(&self) -> Result<Tensor<f32>, TransformerError> {
         if self.rank() != 4 { return Err(TransformerError::TensorError(TensorError::InvalidDimension("permute_mha_qkv expects 4D tensor".into()))); }
         let b = self.shape[0]; let s = self.shape[1]; let h = self.shape[2]; let d = self.shape[3];
@@ -596,7 +568,6 @@ impl TensorExtMHA for Tensor<f32> {
         Tensor::new(new_data, new_shape).map_err(TransformerError::from)
     }
 
-    // Input: [B, H, S, D], Output: [B, H, D, S]
     fn permute_mha_kt(&self) -> Result<Tensor<f32>, TransformerError> {
         if self.rank() != 4 { return Err(TransformerError::TensorError(TensorError::InvalidDimension("permute_mha_kt expects 4D tensor".into()))); }
         let b = self.shape[0]; let h = self.shape[1]; let s = self.shape[2]; let d = self.shape[3];
@@ -616,10 +587,8 @@ impl TensorExtMHA for Tensor<f32> {
         Tensor::new(new_data, new_shape).map_err(TransformerError::from)
     }
     
-    // Input: [B, H, S, D], Output: [B, S, H, D]
     fn permute_mha_output(&self) -> Result<Tensor<f32>, TransformerError> {
         if self.rank() != 4 { return Err(TransformerError::TensorError(TensorError::InvalidDimension("permute_mha_output expects 4D tensor".into()))); }
-        // This is inverse of permute_mha_qkv
         let b = self.shape[0]; let h = self.shape[1]; let s = self.shape[2]; let d = self.shape[3];
         let mut new_data = vec![0.0; self.data.len()];
         let new_shape = vec![b, s, h, d];
@@ -637,16 +606,15 @@ impl TensorExtMHA for Tensor<f32> {
         Tensor::new(new_data, new_shape).map_err(TransformerError::from)
     }
 
-    // Extracts a 2D slice [shape[2], shape[3]] from a 4D tensor [B,H,S,D] at given batch_idx and head_idx
     fn slice_mha(&self, batch_idx: usize, head_idx: usize) -> Result<Tensor<f32>, TransformerError> {
         if self.rank() != 4 { return Err(TransformerError::TensorError(TensorError::InvalidDimension("slice_mha expects 4D tensor".into()))); }
-        let s_dim = self.shape[2]; // seq_len
-        let d_dim = self.shape[3]; // head_dim or seq_len for scores
+        let s_dim = self.shape[2]; 
+        let d_dim = self.shape[3]; 
         
         let mut slice_data = Vec::with_capacity(s_dim * d_dim);
-        let h_stride = self.shape[1]; // num_heads
+        let h_total = self.shape[1]; // Total number of heads in this tensor
 
-        let offset = batch_idx * h_stride * s_dim * d_dim + head_idx * s_dim * d_dim;
+        let offset = batch_idx * h_total * s_dim * d_dim + head_idx * s_dim * d_dim;
 
         for i in 0..(s_dim * d_dim) {
             slice_data.push(self.data[offset + i]);
@@ -656,7 +624,6 @@ impl TensorExtMHA for Tensor<f32> {
 }
 
 impl Tensor<f32> {
-    // Generic transpose for 2D matrix data
     pub fn transpose_data_generic(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
         let mut new_data = vec![0.0; data.len()];
         for r in 0..rows {
@@ -668,14 +635,13 @@ impl Tensor<f32> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn create_dummy_config() -> Config {
         Config {
-            n_layer: 1, // Reduced for faster tests
+            n_layer: 1, 
             n_head: 2,
             n_embd: 4, 
             vocab_size: 10,
@@ -704,13 +670,13 @@ mod tests {
             weights.insert(format!("h.{}.mlp.c_proj.weight", i), Tensor::zeros(vec![4 * n_embd, n_embd]));
             weights.insert(format!("h.{}.mlp.c_proj.bias", i), Tensor::zeros(vec![n_embd]));
 
-            weights.insert(format!("h.{}.ln_1.weight", i), Tensor::zeros(vec![n_embd])); // gamma
-            weights.insert(format!("h.{}.ln_1.bias", i), Tensor::zeros(vec![n_embd]));   // beta
-            weights.insert(format!("h.{}.ln_2.weight", i), Tensor::zeros(vec![n_embd])); // gamma
-            weights.insert(format!("h.{}.ln_2.bias", i), Tensor::zeros(vec![n_embd]));   // beta
+            weights.insert(format!("h.{}.ln_1.weight", i), Tensor::zeros(vec![n_embd])); 
+            weights.insert(format!("h.{}.ln_1.bias", i), Tensor::zeros(vec![n_embd]));   
+            weights.insert(format!("h.{}.ln_2.weight", i), Tensor::zeros(vec![n_embd])); 
+            weights.insert(format!("h.{}.ln_2.bias", i), Tensor::zeros(vec![n_embd]));   
         }
-        weights.insert("ln_f.weight".to_string(), Tensor::zeros(vec![n_embd])); // gamma
-        weights.insert("ln_f.bias".to_string(), Tensor::zeros(vec![n_embd]));   // beta
+        weights.insert("ln_f.weight".to_string(), Tensor::zeros(vec![n_embd])); 
+        weights.insert("ln_f.bias".to_string(), Tensor::zeros(vec![n_embd]));   
         weights
     }
 
@@ -718,7 +684,7 @@ mod tests {
     fn test_config_creation() {
         let config = create_dummy_config();
         assert_eq!(config.n_layer, 1);
-        assert_eq!(config.head_dim(), 2); // n_embd(4) / n_head(2)
+        assert_eq!(config.head_dim(), 2); 
     }
 
     #[test]
@@ -737,7 +703,7 @@ mod tests {
     fn test_mha_creation_invalid_shape() {
         let config = Arc::new(create_dummy_config());
         let n_embd = config.n_embd;
-        let c_attn_w_bad = Tensor::zeros(vec![n_embd, 1 * n_embd]); // Incorrect shape
+        let c_attn_w_bad = Tensor::zeros(vec![n_embd, 1 * n_embd]); 
         let c_attn_b = Tensor::zeros(vec![3 * n_embd]);
         let c_proj_w = Tensor::zeros(vec![n_embd, n_embd]);
         let c_proj_b = Tensor::zeros(vec![n_embd]);
@@ -751,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_ff_creation_valid() {
-        let config = create_dummy_config(); // Not Arc needed for FF new
+        let config = create_dummy_config(); 
         let n_embd = config.n_embd;
         let c_fc_w = Tensor::zeros(vec![n_embd, 4*n_embd]);
         let c_fc_b = Tensor::zeros(vec![4*n_embd]);
@@ -763,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_block_creation_valid() {
-        let config = Arc::new(create_dummy_config()); // Arc for MHA
+        let config = Arc::new(create_dummy_config()); 
         let n_embd = config.n_embd;
 
         let c_attn_w = Tensor::zeros(vec![n_embd, 3 * n_embd]);
@@ -776,14 +742,14 @@ mod tests {
         let mlp_c_fc_b = Tensor::zeros(vec![4*n_embd]);
         let mlp_c_proj_w = Tensor::zeros(vec![4*n_embd, n_embd]);
         let mlp_c_proj_b = Tensor::zeros(vec![n_embd]);
-        let mlp = FeedForward::new(mlp_c_fc_w, mlp_c_fc_b, mlp_c_proj_w, mlp_c_proj_b, &config).unwrap(); // Pass non-Arc config
+        let mlp = FeedForward::new(mlp_c_fc_w, mlp_c_fc_b, mlp_c_proj_w, mlp_c_proj_b, &config).unwrap(); 
 
         let ln_1_g = Tensor::zeros(vec![n_embd]);
         let ln_1_b = Tensor::zeros(vec![n_embd]);
         let ln_2_g = Tensor::zeros(vec![n_embd]);
         let ln_2_b = Tensor::zeros(vec![n_embd]);
 
-        let block = Block::new(attn, mlp, ln_1_g, ln_1_b, ln_2_g, ln_2_b, &config); // Pass non-Arc config
+        let block = Block::new(attn, mlp, ln_1_g, ln_1_b, ln_2_g, ln_2_b, &config); 
         assert!(block.is_ok());
     }
 
@@ -799,7 +765,7 @@ mod tests {
     fn test_gpt2model_creation_missing_weight_error() {
         let config = create_dummy_config();
         let mut weights = create_dummy_weights_for_model(&config);
-        weights.remove("wte.weight"); // Remove a critical weight
+        weights.remove("wte.weight"); 
         let model = GPT2Model::new(config, weights);
         assert!(model.is_err());
         match model.err().unwrap() {
@@ -812,7 +778,6 @@ mod tests {
     fn test_gpt2model_creation_wrong_weight_shape_error() {
         let config = create_dummy_config();
         let mut weights = create_dummy_weights_for_model(&config);
-        // Tamper with a weight's shape
         weights.insert("ln_f.bias".to_string(), Tensor::zeros(vec![config.n_embd + 1])); 
         let model = GPT2Model::new(config, weights);
         assert!(model.is_err());
@@ -824,9 +789,6 @@ mod tests {
 
     #[test]
     fn test_gpt2model_forward_pass_mocked() {
-        // This test uses the actual tensor_engine ops where possible,
-        // and the placeholder extensions for permute/slice.
-        // It's a structural test more than a numerical one.
         let config_obj = create_dummy_config();
         let weights = create_dummy_weights_for_model(&config_obj);
         let model = GPT2Model::new(config_obj.clone(), weights).expect("Model creation should succeed");
@@ -841,12 +803,9 @@ mod tests {
 
         let result = model.forward(&token_ids, None);
 
-        // Given the placeholder nature of permute and slice, errors are possible.
-        // If it passes, it implies the overall flow and shape manipulations are coherent.
         if let Ok(logits) = result {
             assert_eq!(logits.shape, vec![batch_size, seq_len, config_obj.vocab_size]);
         } else {
-            // This might indicate an issue in the placeholder ops or flow.
             panic!("Forward pass failed: {:?}", result.err());
         }
     }
