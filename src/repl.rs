@@ -1,5 +1,10 @@
 use std::io::{self, Write};
 use std::error::Error; // For Box<dyn Error>
+use std::path::PathBuf; // For feedback store path
+
+// Module for feedback mechanism
+mod repl_feedback;
+use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
 
 // Imports for token generation logic
 use ndarray::{ArrayD, Array2}; // s is not used yet, but Array2 is crucial
@@ -88,10 +93,11 @@ pub fn run_repl_loop(
     model: &mut GPT2Model,
     config: &GPT2Config,
     tokenizer: &GPT2Tokenizer,
-    initial_prompt_tokens: Vec<u32>,
+    initial_prompt_tokens: Vec<u32>, // Crucial for logging the first experience's prompt
     max_new_tokens: usize,
     initial_theta_hat: f32,
     eos_token_id: u32,
+    store: &mut ResonanceFeedbackStore, // New parameter for feedback store
 ) -> Result<(), String> {
     if initial_prompt_tokens.is_empty() {
         return Err("Initial prompt tokens cannot be empty for REPL loop.".to_string());
@@ -119,24 +125,61 @@ pub fn run_repl_loop(
         user_feedback = user_feedback.trim().to_lowercase();
 
         let pre_adjustment_theta = current_theta_hat; // For "quit" message consistency
-        let validation_status_str: String;
+        let mut validation_status_str: String; // Made mutable for potential update before logging
 
         if user_feedback == "q" {
             println!("Quitting generation loop.");
+            // For "quit", we don't log an experience, but print the status
+            validation_status_str = "quit".to_string();
             println!(
                 "⟳ [{}] token: \"{}\" | θ̂: {:.2} | validado: {}",
-                i, token_display_id, pre_adjustment_theta, "quit"
+                i, token_display_id, pre_adjustment_theta, validation_status_str
             );
             break;
         }
         
+        // Adjust theta_hat based on feedback
         current_theta_hat = adjust_theta_hat(current_theta_hat, &user_feedback);
 
-        // Determine validation_status_str based on feedback for the print message
+        // Determine validation_status_str and log experience if feedback is 's' or 'n'
         match user_feedback.as_str() {
-            "s" => validation_status_str = "sí".to_string(),
-            "n" => validation_status_str = "no".to_string(),
-            _ => validation_status_str = "n/a".to_string(),
+            "s" | "n" => {
+                let validation_bool = user_feedback == "s";
+                validation_status_str = if validation_bool { "sí".to_string() } else { "no".to_string() };
+
+                // Construct prompt_tokens for ExperienceEntry:
+                // current_token_ids at this point is [P0, P1, ..., Pk, G0, G1, ..., token_display_id]
+                // The prompt for token_display_id is everything *before* it.
+                let context_tokens_for_exp = if current_token_ids.len() > 1 {
+                    current_token_ids[..current_token_ids.len()-1].to_vec()
+                } else {
+                    // This implies token_display_id is the very first token in current_token_ids,
+                    // which means it was the first token generated right after the initial_prompt_tokens.
+                    // In this specific case, the prompt *was* the initial_prompt_tokens.
+                    // However, current_token_ids is formed by: initial_prompt_tokens.clone() then push(first_gen_token).
+                    // So current_token_ids always includes the prompt that led to the first generated token.
+                    // Thus, current_token_ids[..current_token_ids.len()-1] is generally correct.
+                    // If current_token_ids has only 1 element (token_display_id), then prompt is empty.
+                    // This should be okay as run_repl_loop checks for empty initial_prompt_tokens.
+                    // And the first token is added right after prefill.
+                    Vec::new() 
+                };
+
+                let entry = ExperienceEntry {
+                    prompt_tokens: context_tokens_for_exp,
+                    generated_token_id: token_display_id, // The token just validated
+                    validation_status: validation_bool,
+                    // Theta_hat *after* adjustment for this token's validation outcome
+                    theta_hat_at_generation: current_theta_hat, 
+                };
+                store.add_experience(entry);
+                if let Err(e) = store.save() {
+                    eprintln!("\n[Error saving experience: {}]", e);
+                }
+            }
+            _ => { // Invalid input
+                validation_status_str = "n/a".to_string();
+            }
         }
         
         println!(
@@ -215,7 +258,13 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     println!("Starting REPL loop with max_new_tokens={}, initial_theta_hat={}, eos_token_id={}", 
         max_new_tokens, initial_theta_hat, eos_token_id);
 
-    // 7. Call run_repl_loop
+    // 7. Initialize ResonanceFeedbackStore
+    let feedback_store_path = PathBuf::from("resonance_feedback.json");
+    let mut store = ResonanceFeedbackStore::new(feedback_store_path);
+    println!("ResonanceFeedbackStore initialized. Loaded {} existing experiences.", store.experiences.len());
+
+
+    // 8. Call run_repl_loop
     // The run_repl_loop returns Result<(), String>, convert its error to Box<dyn Error>
     run_repl_loop(
         &mut model, 
@@ -224,7 +273,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         initial_prompt_tokens, 
         max_new_tokens, 
         initial_theta_hat, 
-        eos_token_id
+        eos_token_id,
+        &mut store, // Pass the feedback store
     ).map_err(|e| -> Box<dyn Error> { Box::from(e) })?;
 
     println!("--- Standalone REPL Finished ---");
