@@ -76,6 +76,146 @@ impl Tensor<f32> {
         Tensor::new(output_data, self.shape.clone()) // Use self
     }
 
+    pub fn scalar_mul(&self, scalar: f32) -> Result<Tensor<f32>, TensorError> {
+        if self.data.is_empty() && self.num_elements() == 0 { // Handle empty tensor
+            return Ok(self.clone());
+        }
+        let mut new_data = self.data.clone();
+        for val in new_data.iter_mut() {
+            *val *= scalar;
+        }
+        Tensor::new(new_data, self.shape.clone())
+    }
+
+    pub fn concat(tensors: &[&Tensor<f32>], axis: usize) -> Result<Tensor<f32>, TensorError> {
+        if tensors.is_empty() {
+            return Err(TensorError::InvalidDimension("Input tensor slice is empty for concat".to_string()));
+        }
+
+        let first_tensor = tensors[0];
+        let rank = first_tensor.rank();
+
+        if axis >= rank {
+            return Err(TensorError::InvalidDimension(format!(
+                "Concatenation axis {} is out of bounds for tensor rank {}",
+                axis, rank
+            )));
+        }
+
+        let mut output_shape = first_tensor.shape.clone();
+        let mut concat_dim_size = 0;
+        let mut total_elements = 0;
+
+        for (i, t) in tensors.iter().enumerate() {
+            if t.rank() != rank {
+                return Err(TensorError::IncompatibleShapes(format!(
+                    "All tensors must have the same rank. Tensor 0 has rank {}, tensor {} has rank {}",
+                    rank, i, t.rank()
+                )));
+            }
+            for (d, &dim_size) in t.shape.iter().enumerate() {
+                if d != axis && dim_size != output_shape[d] {
+                    return Err(TensorError::IncompatibleShapes(format!(
+                        "Dimension {} mismatch: expected {} (from tensor 0), got {} (from tensor {})",
+                        d, output_shape[d], dim_size, i
+                    )));
+                }
+            }
+            concat_dim_size += t.shape[axis];
+            total_elements += t.num_elements();
+        }
+        output_shape[axis] = concat_dim_size;
+        
+        // Handle all-empty case: if total_elements is 0, all tensors were empty.
+        if total_elements == 0 {
+            return Tensor::new(Vec::new(), output_shape);
+        }
+
+        let mut output_data = Vec::with_capacity(total_elements);
+
+        // Strides for navigating input and output tensors
+        let mut first_tensor_strides = vec![0; rank];
+        if rank > 0 {
+            first_tensor_strides[rank - 1] = 1;
+            for d in (0..rank - 1).rev() {
+                first_tensor_strides[d] = first_tensor_strides[d + 1] * first_tensor.shape[d + 1];
+            }
+        }
+        
+        let mut output_strides = vec![0; rank];
+        if rank > 0 {
+            output_strides[rank - 1] = 1;
+            for d in (0..rank - 1).rev() {
+                output_strides[d] = output_strides[d + 1] * output_shape[d + 1];
+            }
+        }
+
+
+        // Outer dimensions product (dimensions before the concat axis)
+        let outer_dims_product: usize = first_tensor.shape[..axis].iter().product();
+        // Inner dimensions product (dimensions after the concat axis for the first tensor)
+        let inner_dims_product: usize = first_tensor.shape[axis + 1..].iter().product();
+
+
+        for outer_idx in 0..outer_dims_product {
+            for t_ref in tensors {
+                let current_tensor_axis_dim = t_ref.shape[axis];
+                let current_tensor_inner_dims_product: usize = t_ref.shape[axis+1..].iter().product(); // Can be different if axis is not last
+
+                // For each "row" or "slice" defined by outer_idx
+                for axis_el_idx in 0..current_tensor_axis_dim {
+                    // Calculate base starting index for this slice in the current input tensor
+                    // This assumes row-major layout.
+                    // outer_idx selects the "hyper-row" up to the axis.
+                    // axis_el_idx selects the specific "sub-row" along the concatenation axis.
+                    // inner_idx then iterates through the elements within that sub-row.
+                    
+                    // Simplified: calculate start of the block to copy
+                    // Example: if shape is [B, S, D] and axis is 1 (S)
+                    // outer_idx iterates B. t_ref.shape[axis] iterates S for this tensor. inner_dims_product is D.
+                    // The block of data to copy for a given outer_idx and one t_ref is
+                    // t_ref.shape[axis] * inner_dims_product elements.
+                    
+                    // More general approach:
+                    // Calculate the starting flat index for the current "slab" in the input tensor
+                    let mut current_input_flat_idx = 0;
+                    let mut temp_outer_idx = outer_idx;
+                    // Contribution from dimensions before 'axis'
+                    for d in (0..axis).rev() {
+                        current_input_flat_idx += (temp_outer_idx % first_tensor.shape[d]) * first_tensor_strides[d]; // Use first_tensor_strides as non-axis dims are same
+                        temp_outer_idx /= first_tensor.shape[d];
+                    }
+                    // Contribution from 'axis' itself (this is the start of the current "row" along the axis)
+                    current_input_flat_idx += axis_el_idx * (if axis < rank -1 {t_ref.shape[axis+1..].iter().product::<usize>()} else {1});
+                     if axis < rank -1 { // This is actually wrong above, should be stride for axis
+                        let mut stride_for_axis_in_t_ref = 1;
+                        for d_idx in (axis + 1)..rank {
+                           stride_for_axis_in_t_ref *= t_ref.shape[d_idx];
+                        }
+                        current_input_flat_idx = outer_idx * t_ref.shape[axis] * current_tensor_inner_dims_product + axis_el_idx * current_tensor_inner_dims_product;
+                     } else { // axis is the last dimension
+                        current_input_flat_idx = outer_idx * t_ref.shape[axis] + axis_el_idx;
+                     }
+
+
+                    // Copy `inner_dims_product` elements
+                    if t_ref.data.is_empty() && current_tensor_inner_dims_product > 0 {
+                         return Err(TensorError::ShapeMismatch(format!("Tensor data is empty but shape {:?} implies non-empty for concat.", t_ref.shape)));
+                    }
+                    if !t_ref.data.is_empty() { // Only copy if data exists
+                        output_data.extend_from_slice(&t_ref.data[current_input_flat_idx .. current_input_flat_idx + current_tensor_inner_dims_product]);
+                    } else if current_tensor_inner_dims_product > 0 {
+                        // This case should ideally be caught by num_elements check or earlier empty tensor checks
+                        // If shape implies data but data is empty, it's an issue.
+                        // For now, assume if data is empty, inner_dims_product must be 0 for this path.
+                    }
+                }
+            }
+        }
+        Tensor::new(output_data, output_shape)
+    }
+
+
     pub fn matmul_simd(&self, other: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
         // 1. Shape checks (self is A, other is B)
         if self.rank() != 2 || other.rank() != 2 {
@@ -854,5 +994,114 @@ mod tests {
         let actual5 = t5.gelu_simd().unwrap();
         assert_tensors_approx_equal(&actual5, &expected5, FLOAT_TOLERANCE);
         assert_eq!(actual5.data.len(), 0);
+    }
+
+    #[test]
+    fn test_concat_simple_1d() {
+        let t1 = Tensor::new(vec![1.0, 2.0], vec![2]).unwrap();
+        let t2 = Tensor::new(vec![3.0, 4.0], vec![2]).unwrap();
+        let result = Tensor::concat(&[&t1, &t2], 0).unwrap();
+        assert_eq!(result.shape, vec![4]);
+        assert_eq!(result.data, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_concat_2d_axis0() { // Stack rows
+        let t1 = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap(); // [[1,2],[3,4]]
+        let t2 = Tensor::new(vec![5.0, 6.0], vec![1, 2]).unwrap();           // [[5,6]]
+        let result = Tensor::concat(&[&t1, &t2], 0).unwrap();
+        assert_eq!(result.shape, vec![3, 2]);
+        assert_eq!(result.data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_concat_2d_axis1() { // Stack columns
+        let t1 = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap(); // [[1,2],[3,4]]
+        let t2 = Tensor::new(vec![5.0, 6.0], vec![2, 1]).unwrap();           // [[5],[6]]
+        let result = Tensor::concat(&[&t1, &t2], 1).unwrap();
+        assert_eq!(result.shape, vec![2, 3]);
+        assert_eq!(result.data, vec![1.0, 2.0, 5.0, 3.0, 4.0, 6.0]);
+    }
+    
+    #[test]
+    fn test_concat_3d_kv_cache_style_axis1() { // e.g. [batch, seq_len, features]
+        // Past KV: [1, 2, 4] (batch=1, past_seq_len=2, features=4)
+        let past_kv = Tensor::new(
+            (0..8).map(|x| x as f32).collect(), // 0,1,2,3, 4,5,6,7
+            vec![1, 2, 4]
+        ).unwrap();
+        // New KV: [1, 1, 4] (batch=1, new_seq_len=1, features=4)
+        let new_kv = Tensor::new(
+            (8..12).map(|x| x as f32).collect(), // 8,9,10,11
+            vec![1, 1, 4]
+        ).unwrap();
+
+        let result = Tensor::concat(&[&past_kv, &new_kv], 1).unwrap();
+        assert_eq!(result.shape, vec![1, 3, 4]);
+        let expected_data = (0..12).map(|x| x as f32).collect::<Vec<f32>>();
+        assert_eq!(result.data, expected_data);
+    }
+
+    #[test]
+    fn test_concat_4d_kv_cache_style_axis2() { // e.g. [batch, num_heads, seq_len, head_dim]
+        // Past KV: [1, 2, 2, 3] (B=1, H=2, S_past=2, D_head=3)
+        // Data: 0 .. 11
+        let past_kv_data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        let past_kv = Tensor::new(past_kv_data, vec![1, 2, 2, 3]).unwrap();
+        // H0, S0: [0,1,2], S1: [3,4,5]
+        // H1, S0: [6,7,8], S1: [9,10,11]
+
+        // New KV: [1, 2, 1, 3] (B=1, H=2, S_new=1, D_head=3)
+        // Data: 12 .. 17
+        let new_kv_data: Vec<f32> = (12..18).map(|x| x as f32).collect();
+        let new_kv = Tensor::new(new_kv_data, vec![1, 2, 1, 3]).unwrap();
+        // H0, S0: [12,13,14]
+        // H1, S0: [15,16,17]
+        
+        let result = Tensor::concat(&[&past_kv, &new_kv], 2).unwrap(); // Concat along seq_len axis
+        assert_eq!(result.shape, vec![1, 2, 3, 3]); // New shape [B, H, S_past+S_new, D_head]
+
+        let expected_data = vec![
+            // Batch 0
+            // Head 0
+            0.0, 1.0, 2.0, // Past S0
+            3.0, 4.0, 5.0, // Past S1
+            12.0, 13.0, 14.0, // New S0
+            // Head 1
+            6.0, 7.0, 8.0, // Past S0
+            9.0, 10.0, 11.0, // Past S1
+            15.0, 16.0, 17.0, // New S0
+        ];
+        assert_eq!(result.data, expected_data);
+    }
+
+
+    #[test]
+    fn test_concat_error_empty_input() {
+        let result = Tensor::concat(&[], 0);
+        assert!(matches!(result, Err(TensorError::InvalidDimension(s)) if s.contains("Input tensor slice is empty")));
+    }
+
+    #[test]
+    fn test_concat_error_mismatched_ranks() {
+        let t1 = Tensor::new(vec![1.0], vec![1]).unwrap();
+        let t2 = Tensor::new(vec![1.0, 2.0], vec![1, 2]).unwrap();
+        let result = Tensor::concat(&[&t1, &t2], 0);
+        assert!(matches!(result, Err(TensorError::IncompatibleShapes(s)) if s.contains("same rank")) );
+    }
+
+    #[test]
+    fn test_concat_error_invalid_axis() {
+        let t1 = Tensor::new(vec![1.0], vec![1]).unwrap();
+        let result = Tensor::concat(&[&t1], 1); // Axis 1 for 1D tensor
+        assert!(matches!(result, Err(TensorError::InvalidDimension(s)) if s.contains("out of bounds")));
+    }
+
+    #[test]
+    fn test_concat_error_mismatched_shapes_non_axis() {
+        let t1 = Tensor::new(vec![1.0, 2.0], vec![1, 2]).unwrap();
+        let t2 = Tensor::new(vec![3.0, 4.0, 5.0], vec![1, 3]).unwrap(); // Different size on axis 1
+        let result = Tensor::concat(&[&t1, &t2], 0); // Concat along axis 0
+        assert!(matches!(result, Err(TensorError::IncompatibleShapes(s)) if s.contains("Dimension 1 mismatch")));
     }
 }
