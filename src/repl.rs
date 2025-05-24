@@ -6,11 +6,21 @@ use std::path::PathBuf; // For feedback store path
 mod repl_feedback;
 use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
 
+use std::path::Path; // For tokenizer path
+
+// Module for feedback mechanism
+mod repl_feedback;
+use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
+
+// Module for tokenizer
+mod tokenizer;
+use tokenizer::TokenizerWrapper; // Use the new TokenizerWrapper
+
 // Imports for token generation logic
 use ndarray::{ArrayD, Array2}; // s is not used yet, but Array2 is crucial
 use crate::model::{GPT2Model, GPT2Config};
 use crate::common::ModelKVCache;
-use crate::tokenizer::GPT2Tokenizer; // For decoding tokens
+// Removed: use crate::tokenizer::GPT2Tokenizer; 
 
 pub fn get_user_prompt() -> String {
     print!("Enter your prompt: ");
@@ -92,8 +102,8 @@ pub(crate) fn adjust_theta_hat(initial_theta: f32, user_feedback: &str) -> f32 {
 pub fn run_repl_loop(
     model: &mut GPT2Model,
     config: &GPT2Config,
-    tokenizer: &GPT2Tokenizer,
-    initial_prompt_tokens: Vec<u32>, // Crucial for logging the first experience's prompt
+    tokenizer: &TokenizerWrapper, // Changed from GPT2Tokenizer to TokenizerWrapper
+    initial_prompt_tokens: Vec<u32>, 
     max_new_tokens: usize,
     initial_theta_hat: f32,
     eos_token_id: u32,
@@ -124,52 +134,43 @@ pub fn run_repl_loop(
         io::stdin().read_line(&mut user_feedback).expect("Failed to read user feedback.");
         user_feedback = user_feedback.trim().to_lowercase();
 
-        let pre_adjustment_theta = current_theta_hat; // For "quit" message consistency
-        let mut validation_status_str: String; // Made mutable for potential update before logging
+        let pre_adjustment_theta = current_theta_hat; 
+        let mut validation_status_str: String; 
+
+        // Decode the token for display before asking for validation
+        let token_str_display = tokenizer.decode(&[token_display_id], true) // true = skip special tokens
+            .unwrap_or_else(|e| {
+                eprintln!("\n[Warning: Failed to decode token ID {}: {}]", token_display_id, e);
+                format!("[ID:{}]", token_display_id) // Fallback
+            });
 
         if user_feedback == "q" {
             println!("Quitting generation loop.");
-            // For "quit", we don't log an experience, but print the status
             validation_status_str = "quit".to_string();
             println!(
-                "⟳ [{}] token: \"{}\" | θ̂: {:.2} | validado: {}",
-                i, token_display_id, pre_adjustment_theta, validation_status_str
+                "⟳ [{}] token: \"{}\" (ID: {}) | θ̂: {:.2} | validado: {}",
+                i, token_str_display, token_display_id, pre_adjustment_theta, validation_status_str
             );
             break;
         }
         
-        // Adjust theta_hat based on feedback
         current_theta_hat = adjust_theta_hat(current_theta_hat, &user_feedback);
 
-        // Determine validation_status_str and log experience if feedback is 's' or 'n'
         match user_feedback.as_str() {
             "s" | "n" => {
                 let validation_bool = user_feedback == "s";
                 validation_status_str = if validation_bool { "sí".to_string() } else { "no".to_string() };
 
-                // Construct prompt_tokens for ExperienceEntry:
-                // current_token_ids at this point is [P0, P1, ..., Pk, G0, G1, ..., token_display_id]
-                // The prompt for token_display_id is everything *before* it.
                 let context_tokens_for_exp = if current_token_ids.len() > 1 {
                     current_token_ids[..current_token_ids.len()-1].to_vec()
                 } else {
-                    // This implies token_display_id is the very first token in current_token_ids,
-                    // which means it was the first token generated right after the initial_prompt_tokens.
-                    // In this specific case, the prompt *was* the initial_prompt_tokens.
-                    // However, current_token_ids is formed by: initial_prompt_tokens.clone() then push(first_gen_token).
-                    // So current_token_ids always includes the prompt that led to the first generated token.
-                    // Thus, current_token_ids[..current_token_ids.len()-1] is generally correct.
-                    // If current_token_ids has only 1 element (token_display_id), then prompt is empty.
-                    // This should be okay as run_repl_loop checks for empty initial_prompt_tokens.
-                    // And the first token is added right after prefill.
                     Vec::new() 
                 };
 
                 let entry = ExperienceEntry {
                     prompt_tokens: context_tokens_for_exp,
-                    generated_token_id: token_display_id, // The token just validated
+                    generated_token_id: token_display_id, 
                     validation_status: validation_bool,
-                    // Theta_hat *after* adjustment for this token's validation outcome
                     theta_hat_at_generation: current_theta_hat, 
                 };
                 store.add_experience(entry);
@@ -177,14 +178,14 @@ pub fn run_repl_loop(
                     eprintln!("\n[Error saving experience: {}]", e);
                 }
             }
-            _ => { // Invalid input
+            _ => { 
                 validation_status_str = "n/a".to_string();
             }
         }
         
         println!(
-            "⟳ [{}] token: \"{}\" | θ̂: {:.2} | validado: {}",
-            i, token_display_id, current_theta_hat, validation_status_str
+            "⟳ [{}] token: \"{}\" (ID: {}) | θ̂: {:.2} | validado: {}",
+            i, token_str_display, token_display_id, current_theta_hat, validation_status_str
         );
 
         if token_display_id == eos_token_id {
@@ -223,13 +224,14 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("Failed to create GPT2Model: {}", e))?;
     println!("GPT2Model initialized.");
 
-    // 3. Initialize GPT2Tokenizer
-    // This requires vocab and merges files. Assuming they are in standard resource paths.
-    let vocab_path = "resources/tokenizer_data/gpt2/gpt2-vocab.json";
-    let merges_path = "resources/tokenizer_data/gpt2/merges.txt";
-    let tokenizer = GPT2Tokenizer::new(vocab_path, merges_path)
-        .map_err(|e| format!("Failed to create tokenizer. Ensure '{}' and '{}' exist. Error: {}", vocab_path, merges_path, e))?;
-    println!("GPT2Tokenizer initialized.");
+    // 3. Initialize TokenizerWrapper
+    // Using test_tokenizer.json as it's known to exist and be compatible.
+    // Users should replace "test_tokenizer.json" with their actual HuggingFace tokenizer.json path.
+    let tokenizer_path_str = "test_tokenizer.json"; 
+    let tokenizer_path = Path::new(tokenizer_path_str);
+    let tokenizer = TokenizerWrapper::new(tokenizer_path)
+        .map_err(|e| format!("Failed to load TokenizerWrapper from '{}': {}. Ensure the file exists and is a valid HuggingFace tokenizer JSON.", tokenizer_path_str, e))?;
+    println!("TokenizerWrapper initialized from '{}'. Vocab size: {}", tokenizer_path_str, tokenizer.get_vocab_size());
 
     // 4. Get User Prompt
     let prompt_string = get_user_prompt();
@@ -238,17 +240,20 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // 5. Convert Prompt to Tokens (Placeholder)
-    println!("Note: Using placeholder tokenization for prompt (each char -> u32).");
-    let initial_prompt_tokens: Vec<u32> = prompt_string.chars().map(|c| c as u32).collect();
+    // 5. Convert Prompt to Tokens using TokenizerWrapper
+    let initial_prompt_tokens = match tokenizer.encode(&prompt_string, false) { // false = don't add special tokens for prompt
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("Failed to encode prompt: {}. Exiting.", e);
+            return Ok(()); // Return Ok here as main expects Result<(), Box<dyn Error>>
+        }
+    };
     
     if initial_prompt_tokens.is_empty() {
-        // This case might occur if the prompt_string consisted only of characters
-        // that map to 0 or if the mapping logic changes.
-        println!("Tokenized prompt is empty. Exiting.");
+        println!("Tokenized prompt is empty (e.g., input was only special tokens not kept, or tokenizer issue). Exiting.");
         return Ok(());
     }
-    println!("Placeholder tokenized prompt: {:?}", initial_prompt_tokens);
+    println!("Successfully tokenized prompt: {:?}", initial_prompt_tokens);
 
     // 6. Set REPL parameters
     let max_new_tokens = 10;
@@ -300,7 +305,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tokenizer::GPT2Tokenizer; // Required for run_repl_loop test if reactivated
+    // use crate::tokenizer::GPT2Tokenizer; // No longer used directly in tests here
+    // TokenizerWrapper might be needed if we had a test for run_repl_loop that needed specific tokenizer interactions
 
     #[test]
     #[ignore] 
