@@ -2,8 +2,7 @@
 
 use crate::transformer_core::{GPT2Model, TransformerError as ModelError};
 use crate::tensor_engine::{Tensor, TensorError};
-// Not using tokenizer directly in this version, eos_token_id is passed.
-// use crate::tokenizer_core::Tokenizer; 
+use crate::resonance_feedback::ResonanceFeedbackStore; // Added
 
 // 1. TextGeneratorError Enum
 #[derive(Debug)]
@@ -69,7 +68,22 @@ pub fn generate(
     input_ids: Vec<u32>,
     max_length: usize,
     eos_token_id: u32,
+    feedback_store: Option<&ResonanceFeedbackStore> // New parameter
 ) -> Result<Vec<u32>, TextGeneratorError> {
+    // Placeholder for feedback usage
+    if let Some(store) = feedback_store {
+        // TODO: Future enhancement:
+        // Query the feedback_store to potentially adjust generation strategy.
+        // For example, retrieve recent positive/negative experiences
+        // to influence logits or sampling parameters.
+        let recent_feedback = store.get_recent_experiences(5); // Example query
+        // Using a print statement for now to confirm it's accessible
+        // In a real scenario, this might be logged or used more subtly.
+        if !recent_feedback.is_empty() { // Only print if there's actually feedback
+            println!("[TextGenerator] Feedback store available. Found {} recent entries (example).", recent_feedback.len());
+        }
+    }
+
     if input_ids.is_empty() {
         return Err(TextGeneratorError::InvalidInput("Input IDs cannot be empty.".to_string()));
     }
