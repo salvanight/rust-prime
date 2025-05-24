@@ -252,16 +252,31 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     // 6. Set REPL parameters
     let max_new_tokens = 10;
-    let initial_theta_hat = 0.75_f32;
+    // let initial_theta_hat = 0.75_f32; // Default will be set after prediction attempt
     let eos_token_id = config.eos_token_id.unwrap_or(50256); // Use EOS from config or default
-
-    println!("Starting REPL loop with max_new_tokens={}, initial_theta_hat={}, eos_token_id={}", 
-        max_new_tokens, initial_theta_hat, eos_token_id);
 
     // 7. Initialize ResonanceFeedbackStore
     let feedback_store_path = PathBuf::from("resonance_feedback.json");
     let mut store = ResonanceFeedbackStore::new(feedback_store_path);
     println!("ResonanceFeedbackStore initialized. Loaded {} existing experiences.", store.experiences.len());
+
+    // Predict initial_theta_hat based on experiences
+    let mut initial_theta_hat: f32; // Declare, will be set below
+    let default_initial_theta = 0.75_f32; // Define default
+
+    match store.predict_initial_theta(&initial_prompt_tokens) {
+        Some(predicted_theta) => {
+            initial_theta_hat = predicted_theta;
+            println!("Intuition from past experiences suggests an initial theta_hat of: {:.2}", initial_theta_hat);
+        }
+        None => {
+            initial_theta_hat = default_initial_theta;
+            println!("No similar past experiences found to predict initial theta_hat. Starting with default: {:.2}", initial_theta_hat);
+        }
+    }
+    
+    println!("Starting REPL loop with max_new_tokens={}, initial_theta_hat={:.2}, eos_token_id={}", 
+        max_new_tokens, initial_theta_hat, eos_token_id);
 
 
     // 8. Call run_repl_loop
