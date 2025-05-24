@@ -1,6 +1,6 @@
 use ndarray::{ArrayD, IxDyn, Array2, s, Axis}; // Consolidated use statements
 use crate::config::GPT2Config;
-use crate::common::LayerNorm;
+use crate::common::{LayerNorm, ModelKVCache}; // Import ModelKVCache
 use crate::attention::MultiHeadAttention;
 use crate::mlp::MLP;
 
@@ -29,14 +29,16 @@ impl TransformerBlock {
     }
 
     pub fn forward(
-        &self, 
+        &mut self, // Changed to &mut self
         hidden_states: &ArrayD<f32>, 
-        attention_mask: Option<&ArrayD<f32>>
+        layer_kv_cache: &mut Vec<f32>, // Added layer_kv_cache
+        _theta_hat: f32 // Added theta_hat, underscore if not used immediately
     ) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
-        // To avoid unused variable warning if not used yet:
-        if attention_mask.is_some() {} 
-        println!("TransformerBlock forward called with hidden_states shape: {:?}", hidden_states.shape());
-        todo!("Implement TransformerBlock forward pass");
+        // The attention_mask parameter is removed for now.
+        // Cache interaction will implicitly handle attention context.
+        println!("TransformerBlock forward called with hidden_states shape: {:?}, layer_kv_cache length: {}", hidden_states.shape(), layer_kv_cache.len());
+        // Actual implementation will use layer_kv_cache and theta_hat.
+        todo!("Implement TransformerBlock forward pass with cache and theta_hat");
     }
 }
 
@@ -69,20 +71,19 @@ impl GPT2Model {
     }
 
     pub fn forward(
-        &self, 
+        &mut self, // Changed to &mut self
         input_ids: &Array2<i32>, 
-        _attention_mask: Option<&ArrayD<f32>> // Underscore to avoid unused warning for now
+        model_cache: &mut ModelKVCache, // Added model_cache
+        theta_hat: f32 // Added theta_hat
     ) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
         let batch_size = input_ids.shape()[0];
         let seq_len = input_ids.shape()[1];
         
-        // n_embd is the dimensionality of the embeddings.
-        // self.wte_weight is ArrayD but used as 2D [vocab_size, n_embd].
         let n_embd = self.wte_weight.shape()[1]; 
 
-        // 1. Token Embeddings (Placeholder: creating zeros)
+        // 1. Token Embeddings (Placeholder: creating zeros for simplicity)
+        // In a real implementation, this would use self.wte_weight.embedding(input_ids)
         let token_embeddings = ArrayD::zeros((batch_size, seq_len, n_embd).into_dyn());
-        // println!("Token embeddings shape: {:?}", token_embeddings.shape());
 
         // 2. Positional Embeddings
         if seq_len > self.wpe_weight.shape()[0] {
@@ -91,24 +92,34 @@ impl GPT2Model {
                 seq_len, self.wpe_weight.shape()[0]
             ).into());
         }
-        // Slice wpe_weight to get embeddings for the current sequence length.
-        // wpe_weight is conceptually [n_positions, n_embd]. Slice is [seq_len, n_embd].
         let positional_embeddings_slice = self.wpe_weight.slice(s![..seq_len, ..]);
-        
-        // Convert ArrayView to ArrayD for addition and broadcasting.
-        // The slice is 2D [seq_len, n_embd]. We need to make it [1, seq_len, n_embd] to broadcast.
         let positional_embeddings_owned: ArrayD<f32> = positional_embeddings_slice.to_owned().into_dyn();
         let positional_embeddings_broadcastable = positional_embeddings_owned.insert_axis(Axis(0));
-        // println!("Positional embeddings broadcastable shape: {:?}", positional_embeddings_broadcastable.shape());
         
-        // 3. Add token and positional embeddings
-        // token_embeddings: [batch_size, seq_len, n_embd]
-        // positional_embeddings_broadcastable: [1, seq_len, n_embd]
-        // Resulting inputs_embeds: [batch_size, seq_len, n_embd]
-        let inputs_embeds = token_embeddings + positional_embeddings_broadcastable;
-        // println!("Combined input embeddings shape: {:?}", inputs_embeds.shape());
+        let mut hidden_states = token_embeddings + positional_embeddings_broadcastable;
+        // println!("Initial hidden_states shape: {:?}", hidden_states.shape());
+
+        // 3. Pass through Transformer Blocks
+        for (i, block) in self.h.iter_mut().enumerate() {
+            // Each block updates hidden_states.
+            // It also uses/updates its corresponding part of the model_cache.
+            // model_cache is Vec<Vec<f32>>, so model_cache[i] is Vec<f32>
+            hidden_states = block.forward(&hidden_states, &mut model_cache[i], theta_hat)?;
+            // println!("Hidden_states shape after block {}: {:?}", i, hidden_states.shape());
+        }
         
-        // As per subtask: "Return Ok(inputs_embeds) for now, or a placeholder for the final hidden state."
-        Ok(inputs_embeds) 
+        // 4. Final Layer Normalization
+        hidden_states = self.ln_f.forward(&hidden_states)?;
+        // println!("Hidden_states shape after ln_f: {:?}", hidden_states.shape());
+
+        // 5. Language Model Head (Placeholder)
+        // The actual lm_head would be a linear layer mapping hidden_states (n_embd) to vocab_size.
+        // For now, returning the processed hidden_states.
+        // This needs to be updated to return logits of shape [batch_size, seq_len, vocab_size].
+        // Example: let logits = self.lm_head.forward(&hidden_states)?;
+        
+        // For now, we return hidden_states. The caller in main.rs expects logits.
+        // This will be addressed when lm_head is implemented.
+        Ok(hidden_states) 
     }
 }
