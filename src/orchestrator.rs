@@ -163,7 +163,7 @@ impl MoEOrchestrator {
         input_1d_features: &Array1<f32>,
         full_input_tensor: &ArrayD<f32>,
         theta_hat: f32,
-    ) -> Result<(ArrayD<f32>, Vec<(String, CacheTier)>), String> { // Updated signature
+    ) -> Result<ArrayD<f32>, String> {
         let active_experts_with_scores = self.determine_active_experts(input_1d_features, theta_hat)?;
 
         if active_experts_with_scores.is_empty() {
@@ -180,8 +180,6 @@ impl MoEOrchestrator {
         }
 
         let mut final_output_accumulator: Option<ArrayD<f32>> = None;
-        let mut activated_expert_details: Vec<(String, CacheTier)> = Vec::new(); // For collecting details
-
         // This will sum to 1.0 if active_experts_with_scores is not empty, due to re-normalization.
         // let total_renormalized_score: f32 = active_experts_with_scores.iter().map(|(_, score)| score).sum();
 
@@ -189,15 +187,9 @@ impl MoEOrchestrator {
 
         for (expert_index, normalized_score) in &active_experts_with_scores {
             let expert = &self.experts[*expert_index]; // Get ref to expert using index
-            
-            // Collect details for return
-            let name = expert.name();
-            let tier = expert.cache_tier();
-            activated_expert_details.push((name.clone(), tier));
-
             println!(
-                "  - Forwarding to Expert: '{}' (Tier: {:?}) with re-normalized score: {:.4}",
-                name, tier, normalized_score
+                "  - Forwarding to Expert: '{}' with re-normalized score: {:.4}",
+                expert.name(), normalized_score
             );
 
             match expert.forward(full_input_tensor, theta_hat) {
@@ -220,10 +212,7 @@ impl MoEOrchestrator {
         }
         
         // final_output_accumulator should be Some if active_experts_with_scores was not empty.
-        // Return the accumulated output and the details of activated experts.
-        final_output_accumulator
-            .map(|tensor| (tensor, activated_expert_details))
-            .ok_or_else(|| "No expert outputs processed, final_output_accumulator is None. This should not happen if experts were activated.".to_string())
+        final_output_accumulator.ok_or_else(|| "No expert outputs processed, final_output_accumulator is None.".to_string())
     }
 }
 

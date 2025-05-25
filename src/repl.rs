@@ -17,38 +17,10 @@ mod tokenizer;
 use tokenizer::TokenizerWrapper; // Use the new TokenizerWrapper
 
 // Imports for token generation logic
-use ndarray::{s, ArrayD, Array2, Axis, ArrayView1, Array1}; // Added s and Axis, ArrayView1, Array1
+use ndarray::{s, ArrayD, Array2, Axis, ArrayView1}; // Added s and Axis, ArrayView1
 use crate::model::{GPT2Model, GPT2Config};
 use crate::common::ModelKVCache;
 // Removed: use crate::tokenizer::GPT2Tokenizer; 
-
-// Added for MoE Orchestrator
-use crate::moe::{MLPExpert, SymbolicExpert}; 
-use crate::orchestrator::MoEOrchestrator;
-use crate::gating::GatingLayer; 
-use crate::cache_tier::CacheTier; 
-// use crate::system_resources::SystemResources; 
-
-// Helper function for dynamic tier adjustment
-fn determine_and_set_allowed_tiers(
-    orchestrator: &mut MoEOrchestrator,
-    ram_available_gb: f32,
-    theta_hat_value: f32
-) {
-    if ram_available_gb < 2.0 {
-        orchestrator.current_allowed_tiers = vec![CacheTier::L1];
-        // println!("[REPL Policy] RAM < 2GB, setting tiers to L1 only");
-    } else if theta_hat_value > 0.85 && ram_available_gb > 6.0 {
-        orchestrator.current_allowed_tiers = vec![CacheTier::L1, CacheTier::L2, CacheTier::L3];
-        // println!("[REPL Policy] High Theta & RAM, setting tiers to L1, L2, L3");
-    } else if theta_hat_value < 0.5 {
-        orchestrator.current_allowed_tiers = vec![CacheTier::L1];
-        // println!("[REPL Policy] Low Theta (Safe Mode), setting tiers to L1 only");
-    } else {
-        orchestrator.current_allowed_tiers = vec![CacheTier::L1, CacheTier::L2];
-        // println!("[REPL Policy] Default, setting tiers to L1, L2");
-    }
-}
 
 pub fn get_user_prompt() -> String {
     print!("Enter your prompt: ");
@@ -170,80 +142,31 @@ pub fn run_repl_loop(
     initial_theta_hat: f32,
     eos_token_id: u32,
     store: &mut ResonanceFeedbackStore, // New parameter for feedback store
-    orchestrator: &mut MoEOrchestrator, // Added orchestrator
 ) -> Result<(), String> {
     if initial_prompt_tokens.is_empty() {
         return Err("Initial prompt tokens cannot be empty for REPL loop.".to_string());
     }
-    // model_cache is not directly used here anymore, orchestrator might manage its own or model does.
-    // For now, we remove direct model_cache management from REPL if orchestrator.forward handles it.
-    // Based on orchestrator.forward not taking model_cache, model itself must be handling it with its own state.
-    // Let's assume GPT2Model::forward and its sub-components like TransformerBlock manage their own cache state
-    // or that orchestrator.forward implicitly passes it if needed.
-    // The current GPT2Model::forward takes a ModelKVCache, so we still need it.
-    let mut model_cache: ModelKVCache = vec![Vec::new(); config.n_layer as usize]; // Keep if model.forward needs it
-    
+    let mut model_cache: ModelKVCache = vec![Vec::new(); config.n_layer as usize];
     let mut current_token_ids = initial_prompt_tokens.clone();
     let mut current_theta_hat = initial_theta_hat;
 
     println!("> prompt: (tokens) {:?}", initial_prompt_tokens);
     
-    // Initial tier determination before prefill
-    orchestrator.system_status.refresh(); // Refresh status for fresh RAM info
-    let ram_gb_prefill = orchestrator.system_status.ram_available_gb;
-    determine_and_set_allowed_tiers(orchestrator, ram_gb_prefill, current_theta_hat);
-    
-    // Prefill using orchestrator
-    let prompt_embeddings = model.get_embeddings(&current_token_ids)?;
-    let last_prompt_embedding_slice = prompt_embeddings.slice(s![0, prompt_embeddings.shape()[1] - 1, ..]);
-    let input_1d_features_prefill = Array1::from_vec(last_prompt_embedding_slice.to_vec());
-
-    // orchestrator.forward might need the model_cache if experts use it.
-    // The current setup has model.forward inside expert.forward in some cases.
-    // For now, orchestrator.forward does not take model_cache.
-    // This implies that if experts call model.forward, the model's internal state or cache handling needs to be robust.
-    // Or, the experts themselves get the cache. This is slightly ambiguous.
-    // Let's assume for now that experts *don't* directly interact with ModelKVCache passed at this level.
-    // The model itself in GPT2Model::forward takes the cache.
-    // If `orchestrator.forward` calls `expert.forward` which *then* calls `model.forward` (unlikely for typical MoE),
-    // then `model` would need to be part of the expert or passed to `expert.forward`.
-    // The current `Expert` trait's `forward` method does not take `ModelKVCache`.
-    // This means the placeholder `model.get_embeddings` and `orchestrator.forward` are the main path.
-    // The `model_cache` is thus NOT directly used by `orchestrator.forward`.
-    // However, the `GPT2Model::forward` (which *is* called by current Experts) *does* use `ModelKVCache`.
-    // This is a contradiction. The prompt for this step implies replacing model.forward calls with orchestrator.forward.
-    // The `Expert::forward` methods (MLPExpert, SymbolicExpert) in `src/moe.rs` *do not* call `model.forward`. They are simulated.
-    // So, `model_cache` is not used by the `orchestrator.forward` path with current experts.
-    // I will remove `model_cache` from the REPL loop if it's not used by the new path.
-    // Re-checking `GPT2Model::forward` signature in `src/model.rs`: `fn forward(&mut self, input_ids: &Array2<i32>, model_cache: &mut ModelKVCache, theta_hat: f32)`
-    // Re-checking `Expert::forward` in `src/moe.rs`: `fn forward(&self, input: &ArrayD<f32>, theta_hat: f32) -> Result<ArrayD<f32>, String>`
-    // The `input` to `Expert::forward` is `full_input_tensor` from `orchestrator.forward`, which are the embeddings.
-    // The experts *do not* call `model.forward`. They operate on embeddings.
-    // So, `model_cache` is not needed for the `orchestrator.forward` path.
-    // I will comment out `model_cache` usage in `run_repl_loop`.
-
-    // let prefill_output_array = prefill_prompt(
-    //     model, config, &current_token_ids, &mut model_cache, current_theta_hat
-    // )?;
-    let (prefill_output_array_logits, activated_experts_info_prefill) = orchestrator.forward(
-        &input_1d_features_prefill,
-        &prompt_embeddings,
-        current_theta_hat
-    ).map_err(|e| format!("Orchestrator forward pass failed during prefill: {}", e))?;
-
+    let prefill_output_array = prefill_prompt(
+        model, config, &current_token_ids, &mut model_cache, current_theta_hat
+    )?;
 
     // Use the new get_greedy_token_and_logit function
     // Process prefill output to get the first generated token
-    let (first_generated_token_id, first_dominant_logit) = get_greedy_token_and_logit(&prefill_output_array_logits)?;
-    let first_top_k_alternatives = get_top_k_tokens(&prefill_output_array_logits, 4); // Get top 4 for up to 3 alternatives
+    let (first_generated_token_id, first_dominant_logit) = get_greedy_token_and_logit(&prefill_output_array)?;
+    let first_top_k_alternatives = get_top_k_tokens(&prefill_output_array, 4); // Get top 4 for up to 3 alternatives
     
     let mut next_token_id = first_generated_token_id;
     current_token_ids.push(next_token_id);
 
-    // Variables to hold current iteration's logit info and expert info for display
+    // Variables to hold current iteration's logit info for display
     let mut dominant_logit_value_for_display = first_dominant_logit;
     let mut top_k_alternatives_for_display = first_top_k_alternatives;
-    let mut experts_info_for_display: Vec<(String, CacheTier)> = activated_experts_info_prefill;
     
     for i in 0..max_new_tokens {
         let token_display_id = next_token_id; // This is the token generated in the previous step (or from prefill)
@@ -273,17 +196,6 @@ pub fn run_repl_loop(
                 "⟳ [{}] token: \"{}\" (ID: {}, Logit: {:.2}) | θ̂: {:.2} | validado: {}",
                 i, token_str_display, token_display_id, dominant_logit_value_for_display, pre_adjustment_theta, validation_status_str
             );
-            // Display activated experts for the quit token
-            if !experts_info_for_display.is_empty() {
-                let experts_display_str = experts_info_for_display
-                    .iter()
-                    .map(|(name, tier)| format!("{} ({:?})", name, tier))
-                    .collect::<Vec<String>>()
-                    .join(", ");
-                println!("  Expertos activados (quit): {}", experts_display_str);
-            } else {
-                println!("  Expertos activados (quit): None");
-            }
             // Alternatives for the quit token
             println!("  Alternatives for quit token (ID: {}):", token_display_id);
             let mut alternatives_shown_quit = 0;
@@ -330,17 +242,6 @@ pub fn run_repl_loop(
             "⟳ [{}] token: \"{}\" (ID: {}, Logit: {:.2}) | θ̂: {:.2} | validado: {}",
             i, token_str_display, token_display_id, dominant_logit_value_for_display, current_theta_hat, validation_status_str
         );
-        // Display activated experts
-        if !experts_info_for_display.is_empty() {
-            let experts_display_str = experts_info_for_display
-                .iter()
-                .map(|(name, tier)| format!("{} ({:?})", name, tier))
-                .collect::<Vec<String>>()
-                .join(", ");
-            println!("  Expertos activados: {}", experts_display_str);
-        } else {
-            println!("  Expertos activados: None");
-        }
         // Display alternatives
         println!("  Alternatives:");
         let mut alternatives_shown = 0;
@@ -363,36 +264,21 @@ pub fn run_repl_loop(
         if i < max_new_tokens - 1 {
             let last_token_id_for_gen = token_display_id; // The token we just processed
             
-            // Dynamic tier adjustment before next token generation
-            orchestrator.system_status.refresh(); // Refresh status for fresh RAM info
-            let ram_gb_next_token = orchestrator.system_status.ram_available_gb;
-            determine_and_set_allowed_tiers(orchestrator, ram_gb_next_token, current_theta_hat);
-
-            // Generate logits for the *next* token using orchestrator
-            let token_embedding_next = model.get_embeddings(&[last_token_id_for_gen])?;
-            let current_token_embedding_slice = token_embedding_next.slice(s![0, 0, ..]);
-            let input_1d_features_next = Array1::from_vec(current_token_embedding_slice.to_vec());
+            // Generate logits for the *next* token
+            let next_logits = generate_next_token(
+                model, config, last_token_id_for_gen, &mut model_cache, current_theta_hat
+            )?;
             
-            // let next_logits = generate_next_token(
-            //     model, config, last_token_id_for_gen, &mut model_cache, current_theta_hat
-            // )?;
-            let (next_logits_output, activated_experts_info_next) = orchestrator.forward(
-                &input_1d_features_next,
-                &token_embedding_next,
-                current_theta_hat
-            ).map_err(|e| format!("Orchestrator forward pass failed for next token: {}", e))?;
-
             // Determine the next token and its logit info based on these new logits
-            let (chosen_next_token_id, next_dominant_logit) = get_greedy_token_and_logit(&next_logits_output)?;
-            let next_top_k_alternatives = get_top_k_tokens(&next_logits_output, 4);
+            let (chosen_next_token_id, next_dominant_logit) = get_greedy_token_and_logit(&next_logits)?;
+            let next_top_k_alternatives = get_top_k_tokens(&next_logits, 4);
 
             next_token_id = chosen_next_token_id;
             current_token_ids.push(next_token_id);
 
-            // Update logit info and expert info for the display in the *next* iteration
+            // Update logit info for the display in the *next* iteration
             dominant_logit_value_for_display = next_dominant_logit;
             top_k_alternatives_for_display = next_top_k_alternatives;
-            experts_info_for_display = activated_experts_info_next;
         }
     }
 
@@ -477,38 +363,17 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         max_new_tokens, initial_theta_hat, eos_token_id);
 
 
-    // Instantiate MoEOrchestrator
-    let experts: Vec<Box<dyn crate::moe::Expert>> = vec![
-        Box::new(SymbolicExpert::new("SymbolicL1", 0.5)), // L1
-        Box::new(MLPExpert::new("MLPL2")),                // L2
-    ];
-    let num_features_for_gating = config.n_embd as usize;
-    let gating_layer = GatingLayer::new(num_features_for_gating, experts.len());
-    
-    let mut orchestrator = MoEOrchestrator::new(
-        experts,
-        gating_layer,
-        None,    // max_concurrent_experts_override
-        0.5,     // min_ram_gb_per_expert
-        0.8,     // high_cpu_load_threshold
-        1,       // num_experts_in_high_load
-        2        // default_top_k_experts (can be small as tier logic will filter first)
-    );
-    // orchestrator.system_status.refresh(); // Initial refresh before REPL loop if needed by first policy check
-
-
     // 8. Call run_repl_loop
     // The run_repl_loop returns Result<(), String>, convert its error to Box<dyn Error>
     run_repl_loop(
         &mut model, 
-        &config, // config is still needed for EOS token, and potentially by Gpt2Model methods if not fully via orchestrator
+        &config, 
         &tokenizer, 
         initial_prompt_tokens, 
         max_new_tokens, 
         initial_theta_hat, 
         eos_token_id,
         &mut store, // Pass the feedback store
-        &mut orchestrator, // Pass the orchestrator
     ).map_err(|e| -> Box<dyn Error> { Box::from(e) })?;
 
     println!("--- Standalone REPL Finished ---");
@@ -536,16 +401,9 @@ mod tests {
     #[cfg(test)]
     mod repl_logic_tests {
         use super::*;
-        use crate::model::{GPT2Model, GPT2Config}; // Keep GPT2Model and Config for existing tests
-        use crate::common::ModelKVCache; // Keep for existing tests
-        // Added for new tier logic tests
-        use crate::orchestrator::MoEOrchestrator;
-        use crate::gating::GatingLayer;
-        use crate::moe::{SymbolicExpert, MLPExpert, Expert}; // And Expert trait
-        use crate::cache_tier::CacheTier;
+        use crate::model::{GPT2Model, GPT2Config};
+        use crate::common::ModelKVCache;
 
-
-        // Helper for existing tests
         fn create_test_config() -> GPT2Config {
             GPT2Config {
                 vocab_size: 50257, n_layer: 2, n_head: 2, n_embd: 128,
@@ -730,89 +588,6 @@ mod tests {
 
             // Test 'n' that would go below 0.0
             assert!((adjust_theta_hat(0.01, "n") - 0.0).abs() < f32::EPSILON); // 0.01 - 0.05 = -0.04 -> 0.0
-        }
-
-        // --- Tests for determine_and_set_allowed_tiers ---
-
-        // Helper to create a minimal orchestrator for these tests
-        fn create_test_orchestrator_for_tier_logic() -> MoEOrchestrator {
-            let experts: Vec<Box<dyn Expert>> = vec![
-                Box::new(SymbolicExpert::new("S",0.0)), Box::new(MLPExpert::new("M"))
-            ];
-            let gating = GatingLayer::new(10, experts.len()); // Dummy values
-            // Ensure MoEOrchestrator::new parameters match its definition
-            MoEOrchestrator::new(
-                experts, 
-                gating, 
-                None,    // max_concurrent_experts_override
-                0.5,     // min_ram_gb_per_expert
-                0.8,     // high_cpu_load_threshold
-                1,       // num_experts_in_high_load
-                2        // default_top_k_experts - this is num_to_activate, not directly tier related for this test
-            )
-        }
-
-        #[test]
-        fn test_determine_allowed_tiers_ram_low() {
-            let mut orchestrator = create_test_orchestrator_for_tier_logic();
-            // RAM is low, theta irrelevant for this rule
-            determine_and_set_allowed_tiers(&mut orchestrator, 1.5, 0.7); 
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1]);
-        }
-
-        #[test]
-        fn test_determine_allowed_tiers_high_theta_high_ram() {
-            let mut orchestrator = create_test_orchestrator_for_tier_logic();
-            determine_and_set_allowed_tiers(&mut orchestrator, 7.0, 0.9);
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1, CacheTier::L2, CacheTier::L3]);
-        }
-
-        #[test]
-        fn test_determine_allowed_tiers_low_theta_safe_mode() {
-            let mut orchestrator = create_test_orchestrator_for_tier_logic();
-            // RAM is high, but theta is low
-            determine_and_set_allowed_tiers(&mut orchestrator, 7.0, 0.4); 
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1]);
-        }
-
-        #[test]
-        fn test_determine_allowed_tiers_default_case() {
-            let mut orchestrator = create_test_orchestrator_for_tier_logic();
-            // RAM is moderate, theta is moderate
-            determine_and_set_allowed_tiers(&mut orchestrator, 4.0, 0.7); 
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1, CacheTier::L2]);
-        }
-
-        #[test]
-        fn test_determine_allowed_tiers_ram_boundary() {
-            let mut orchestrator = create_test_orchestrator_for_tier_logic();
-            // RAM just at 2.0GB, should not trigger < 2.0 rule
-            determine_and_set_allowed_tiers(&mut orchestrator, 2.0, 0.7); 
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1, CacheTier::L2]); // Default
-        }
-
-        #[test]
-        fn test_determine_allowed_tiers_theta_ram_boundaries_for_l1_l2_l3() {
-            let mut orchestrator = create_test_orchestrator_for_tier_logic();
-            // Theta just above 0.85, RAM just above 6.0
-            determine_and_set_allowed_tiers(&mut orchestrator, 6.1, 0.86);
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1, CacheTier::L2, CacheTier::L3]);
-
-            // Theta at 0.85 (not >0.85), RAM high -> default
-            determine_and_set_allowed_tiers(&mut orchestrator, 6.1, 0.85);
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1, CacheTier::L2]);
-            
-            // Theta high, RAM at 6.0 (not >6.0) -> default
-            determine_and_set_allowed_tiers(&mut orchestrator, 6.0, 0.86);
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1, CacheTier::L2]);
-        }
-
-        #[test]
-        fn test_determine_allowed_tiers_theta_boundary_for_safe_mode() {
-            let mut orchestrator = create_test_orchestrator_for_tier_logic();
-            // Theta just at 0.5 (not <0.5), RAM high -> default
-            determine_and_set_allowed_tiers(&mut orchestrator, 7.0, 0.5);
-            assert_eq!(orchestrator.current_allowed_tiers, vec![CacheTier::L1, CacheTier::L2]);
         }
     }
 }

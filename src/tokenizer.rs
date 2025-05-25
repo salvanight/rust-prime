@@ -1,6 +1,17 @@
 // Renaming import for clarity, though not strictly necessary if TruncationParams and PaddingParams are not used elsewhere.
 // For this file, direct use of tokenizers::TruncationParams and tokenizers::PaddingParams in method signatures is fine.
-use tokenizers::{Tokenizer, Error as TokenizersLibraryError, PaddingParams, TruncationParams, AddedToken}; // Import Error for From trait
+use tokenizers::{
+    Tokenizer, 
+    Error as TokenizersLibraryError, 
+    PaddingParams, 
+    TruncationParams, 
+    AddedToken,
+    models::bpe::BPE,
+    pre_tokenizers::byte_level::ByteLevel as ByteLevelPretokenizer,
+    decoders::byte_level::ByteLevel as ByteLevelDecoder,
+    // normalizers::utils::Sequence as NormalizerSequence, // For potential NFC normalizer
+    // normalizers::unicode::NFC,
+};
 use std::path::{Path, PathBuf}; // Added PathBuf for error context
 use std::fmt;
 use std::io; // For std::io::Error
@@ -87,7 +98,9 @@ impl From<TokenizersLibraryError> for TokenizerError {
 ///
 /// This struct holds an instance of `tokenizers::Tokenizer` and provides methods
 /// that map to its core functionalities, along with custom error handling
-/// defined by `TokenizerError`.
+/// defined by `TokenizerError`. It supports loading pre-configured tokenizers from a single
+/// JSON file (via `new()`) or constructing specific tokenizers like GPT-2 from their
+/// constituent vocabulary and merge files (via `from_gpt2_files()`).
 ///
 /// ## Optional Debug Logging
 /// This crate includes optional debug logging via the `log` crate. To enable it, compile
@@ -106,6 +119,8 @@ pub struct TokenizerWrapper {
 
 impl TokenizerWrapper {
     /// Creates a new `TokenizerWrapper` by loading a tokenizer model from the specified file path.
+    /// This method is suitable for loading tokenizer configurations that are fully defined
+    /// in a single `tokenizer.json` file.
     ///
     /// # Parameters
     /// - `tokenizer_path`: A reference to a `Path` pointing to the tokenizer model file
@@ -133,6 +148,74 @@ impl TokenizerWrapper {
         trace!("Successfully loaded tokenizer from path: {:?}", tokenizer_path);
         Ok(Self { tokenizer: tokenizer_instance })
     }
+
+    /// Creates a new `TokenizerWrapper` specifically configured for a GPT-2 style tokenizer
+    /// from the given vocabulary and merges files.
+    ///
+    /// This method sets up a Byte Pair Encoding (BPE) model using the provided vocabulary
+    /// and merge rules. It configures the tokenizer with components standard for GPT-2:
+    /// - **Model**: BPE model with `<|endoftext|>` as the unknown token.
+    /// - **Pre-tokenizer**: `ByteLevel` pre-tokenizer with `add_prefix_space: false` and `trim_offsets: true`.
+    /// - **Decoder**: `ByteLevel` decoder.
+    ///
+    /// No explicit normalizer (e.g., NFC) or post-processor (e.g., for BOS/EOS tokens like `<|endoftext|>`)
+    /// is added by this method. The `add_special_tokens` flag in the `encode` method might not automatically
+    /// prepend/append BOS/EOS tokens unless the underlying model or a (not-set-here) post-processor handles it.
+    /// For GPT-2, `<|endoftext|>` (ID 50256) often serves as the EOS token and sometimes as a BOS token,
+    /// typically managed by the application or training process by including it in the input sequence.
+    ///
+    /// # Parameters
+    /// - `vocab_path`: Path to the GPT-2 vocabulary JSON file (e.g., `gpt2-vocab.json`).
+    ///   This file maps tokens to their IDs.
+    /// - `merges_path`: Path to the GPT-2 merges text file (e.g., `merges.txt`).
+    ///   This file defines the BPE merge rules.
+    ///
+    /// # Returns
+    /// - `Ok(Self)`: A new `TokenizerWrapper` instance configured for GPT-2.
+    /// - `Err(TokenizerError::FailedToLoad)`: If path conversion to string fails (e.g., invalid UTF-8 in paths)
+    ///   or if the vocab/merges files cannot be read by the BPE builder.
+    /// - `Err(TokenizerError::Library)`: If building the BPE model or configuring the tokenizer components fails
+    ///   for other reasons (e.g., an invalid `unk_token` if it were not part of the vocab).
+    pub fn from_gpt2_files(vocab_path: &Path, merges_path: &Path) -> Result<Self, TokenizerError> {
+        #[cfg(feature = "tokenizer-debug-logs")]
+        debug!(
+            "Attempting to load GPT-2 tokenizer from vocab: {:?}, merges: {:?}",
+            vocab_path, merges_path
+        );
+
+        let vocab_str = vocab_path.to_str().ok_or_else(|| TokenizerError::FailedToLoad {
+            path: vocab_path.to_path_buf(),
+            source_message: "Invalid vocab path (not valid UTF-8)".to_string()
+        })?;
+        let merges_str = merges_path.to_str().ok_or_else(|| TokenizerError::FailedToLoad {
+            path: merges_path.to_path_buf(),
+            source_message: "Invalid merges path (not valid UTF-8)".to_string()
+        })?;
+
+        let bpe_model = BPE::from_files(vocab_str, merges_str)
+            .unk_token("<|endoftext|>") 
+            .build()
+            .map_err(|e| TokenizerError::Library(format!("Failed to build BPE model: {}", e)))?;
+
+        let mut tokenizer = Tokenizer::new(Box::new(bpe_model));
+
+        // GPT-2 uses byte-level pre-tokenization without adding a prefix space by default.
+        // ByteLevelPretokenizer::new(add_prefix_space: bool, trim_offsets: bool (use_regex in some versions))
+        // For GPT-2, add_prefix_space is typically false. trim_offsets is true.
+        let pre_tokenizer = ByteLevelPretokenizer::new(false, true);
+        tokenizer.with_pre_tokenizer(Box::new(pre_tokenizer));
+        
+        tokenizer.with_decoder(Box::new(ByteLevelDecoder::default()));
+
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!(
+            "Successfully configured GPT-2 style tokenizer. Vocab size: {}",
+            tokenizer.get_vocab_size(true)
+        );
+
+        Ok(Self { tokenizer })
+    }
+
 
     /// Encodes a given text string into a sequence of token IDs.
     ///
@@ -506,6 +589,163 @@ mod tests {
 
     // NamedTempFile handles cleanup automatically when it goes out of scope.
 }
+
+// Test `test_investigate_gpt2_tokenizer_loading` is removed as per instructions.
+// Test `test_load_gpt2_from_files` is moved into the new module `gpt2_integration_tests`
+// and renamed to `test_gpt2_load_and_basic_encode_decode`.
+
+#[cfg(test)]
+mod gpt2_integration_tests {
+    use crate::tokenizer::{TokenizerWrapper, TokenizerError, EncodeOptions, AddedToken};
+    use std::path::{Path, PathBuf};
+
+    fn gpt2_vocab_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/tokenizer_data/gpt2/gpt2-vocab.json")
+    }
+
+    fn gpt2_merges_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/tokenizer_data/gpt2/merges.txt")
+    }
+
+    // Helper to load the GPT-2 tokenizer for tests in this module
+    fn load_gpt2_tokenizer_for_test() -> TokenizerWrapper {
+        let vocab_path = gpt2_vocab_path();
+        let merges_path = gpt2_merges_path();
+        assert!(vocab_path.exists(), "GPT-2 vocab file not found at {:?}", vocab_path);
+        assert!(merges_path.exists(), "GPT-2 merges file not found at {:?}", merges_path);
+        TokenizerWrapper::from_gpt2_files(&vocab_path, &merges_path)
+            .expect("Failed to load GPT-2 tokenizer for test")
+    }
+
+    #[test]
+    fn test_gpt2_load_and_basic_encode_decode() {
+        let wrapper = load_gpt2_tokenizer_for_test();
+        
+        let vocab_size = wrapper.get_vocab_size();
+        assert_eq!(vocab_size, 50257, "GPT-2 vocab size mismatch.");
+
+        let text_to_encode = "hello world"; // Note: GPT-2 is case-sensitive.
+        match wrapper.encode(text_to_encode, false, None) {
+            Ok(ids) => {
+                // Standard GPT-2 tokenization: "hello" -> 31373, " world" -> 995
+                assert_eq!(ids, vec![31373, 995], "GPT-2 encoding of 'hello world' mismatch. Got: {:?}", ids);
+                match wrapper.decode(&ids, true) {
+                    Ok(decoded_text) => {
+                        assert_eq!(decoded_text, "hello world", "GPT-2 decoding mismatch.");
+                    }
+                    Err(e) => panic!("[GPT-2 Basic Test] Decoding failed: {}", e),
+                }
+            }
+            Err(e) => panic!("[GPT-2 Basic Test] Encoding failed: {}", e),
+        }
+
+        let text_to_encode_caps = "Hello World";
+         match wrapper.encode(text_to_encode_caps, false, None) {
+            Ok(ids_caps) => {
+                // "Hello" -> 15496, " World" ->  2769 (note: different from lowercase " world")
+                assert_eq!(ids_caps, vec![15496, 2769], "GPT-2 encoding of 'Hello World' mismatch. Got: {:?}", ids_caps);
+                 match wrapper.decode(&ids_caps, true) {
+                    Ok(decoded_text_caps) => {
+                        assert_eq!(decoded_text_caps, "Hello World", "GPT-2 decoding of caps mismatch.");
+                    }
+                    Err(e) => panic!("[GPT-2 Basic Test] Decoding caps failed: {}", e),
+                }
+            }
+            Err(e) => panic!("[GPT-2 Basic Test] Encoding caps failed: {}", e),
+        }
+
+
+        // Test with add_special_tokens=true
+        // For GPT-2, <|endoftext|> (ID 50256) is the EOS token.
+        // Current `from_gpt2_files` does not add a post-processor for BOS/EOS.
+        // So, `add_special_tokens=true` is not expected to add these automatically for GPT-2.
+        let encode_special_res = wrapper.encode(text_to_encode, true, None);
+            match encode_special_res {
+            Ok(ids_special) => {
+                assert_eq!(ids_special, vec![31373, 995], 
+                    "GPT-2 encoding of 'hello world' with add_special_tokens=true should be [31373, 995] for this basic setup. Got: {:?}", ids_special);
+            }
+            Err(e) => panic!("[GPT-2 Basic Test] Encoding with add_special_tokens=true failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_gpt2_encode_decode_sentence() {
+        let wrapper = load_gpt2_tokenizer_for_test();
+        let sentence = "Hello world, how are you?<|endoftext|>"; 
+        // Expected IDs based on standard GPT-2 tokenization:
+        // "Hello" -> 15496
+        // " world" -> 995  (ByteLevel pretokenizer makes " world" -> "Ġworld")
+        // "," -> 11
+        // " how" -> 1268
+        // " are" -> 526
+        // " you" -> 290
+        // "?" -> 30
+        // "<|endoftext|>" -> 50256 (This is a single token in GPT-2 vocab)
+        let expected_ids = vec![15496, 995, 11, 1268, 526, 290, 30, 50256];
+
+        match wrapper.encode(sentence, false, None) { // add_special_tokens=false because EOT is in string
+            Ok(ids) => {
+                assert_eq!(ids, expected_ids, "GPT-2 encoding of sentence mismatch. Got: {:?}", ids);
+                match wrapper.decode(&ids, false) { // skip_special_tokens=false to keep <|endoftext|>
+                    Ok(decoded_text) => {
+                        assert_eq!(decoded_text, sentence, "GPT-2 decoding of sentence mismatch.");
+                    }
+                    Err(e) => panic!("[GPT-2 Sentence Test] Decoding failed: {}", e),
+                }
+            }
+            Err(e) => panic!("[GPT-2 Sentence Test] Encoding failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_gpt2_add_new_tokens() {
+        let mut wrapper = load_gpt2_tokenizer_for_test();
+        let initial_vocab_size = wrapper.get_vocab_size();
+        assert_eq!(initial_vocab_size, 50257, "Initial GPT-2 vocab size incorrect.");
+
+        let new_tokens_to_add = [
+            AddedToken::from("mycustomtokenXYZ", true).single_word(true),
+            AddedToken::from("<|anotherspecialtok|>", true).single_word(true),
+        ];
+
+        let num_added = wrapper.add_new_tokens(&new_tokens_to_add).expect("Failed to add new tokens to GPT-2 tokenizer");
+        assert_eq!(num_added, 2, "Expected 2 tokens to be added to GPT-2 tokenizer.");
+
+        let new_vocab_size = wrapper.get_vocab_size();
+        assert_eq!(new_vocab_size, initial_vocab_size + num_added as u32, "GPT-2 vocabulary size did not update correctly after adding tokens.");
+
+        // Verify encoding of new tokens
+        let id_custom = wrapper.tokenizer.token_to_id("mycustomtokenXYZ").expect("New token 'mycustomtokenXYZ' not found in vocab");
+        let id_special_new = wrapper.tokenizer.token_to_id("<|anotherspecialtok|>").expect("New token '<|anotherspecialtok|>' not found in vocab");
+
+        assert_eq!(id_custom, initial_vocab_size); // First new ID
+        assert_eq!(id_special_new, initial_vocab_size + 1); // Second new ID
+        
+        let encoded_custom = wrapper.encode("mycustomtokenXYZ", false, None).unwrap();
+        assert_eq!(encoded_custom, vec![id_custom], "Encoding new token 'mycustomtokenXYZ' failed.");
+        // For GPT-2, ByteLevel decoder output might differ slightly for entirely new tokens if they don't map to existing byte sequences well.
+        // However, if added as a single word, it should decode back to itself.
+        assert_eq!(wrapper.decode(&encoded_custom, true).unwrap(), "mycustomtokenXYZ");
+
+
+        let encoded_special_new = wrapper.encode("<|anotherspecialtok|>", false, None).unwrap();
+        assert_eq!(encoded_special_new, vec![id_special_new], "Encoding new token '<|anotherspecialtok|>' failed.");
+        assert_eq!(wrapper.decode(&encoded_special_new, true).unwrap(), "<|anotherspecialtok|>");
+        
+        // Test combined: "hello mycustomtokenXYZ <|anotherspecialtok|>"
+        // The ByteLevel pretokenizer will process " mycustomtokenXYZ" as "ĠmycustomtokenXYZ".
+        // Since "mycustomtokenXYZ" was added (without Ġ), and "<|anotherspecialtok|>" was added (without Ġ),
+        // the behavior of ByteLevel BPE for sequences with spaces around these new tokens can be complex.
+        // The `add_tokens` with `single_word=true` makes the *exact* string a single token.
+        // So, " mycustomtokenXYZ" would be tokenized as "Ġ" then "mycustomtokenXYZ" *if* "mycustomtokenXYZ" is known.
+        // Let's test a simpler case where new tokens are not directly preceded by space that becomes "Ġ".
+        let text_simple_mixed = "mycustomtokenXYZ<|anotherspecialtok|>"; // No space, direct concatenation
+        let encoded_simple_mixed = wrapper.encode(text_simple_mixed, false, None).unwrap();
+        assert_eq!(encoded_simple_mixed, vec![id_custom, id_special_new], "Encoding simple mixed new tokens failed.");
+    }
+}
+
 
 #[cfg(test)]
 mod proptests {
