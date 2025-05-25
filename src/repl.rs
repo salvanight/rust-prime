@@ -17,7 +17,7 @@ mod tokenizer;
 use tokenizer::TokenizerWrapper; // Use the new TokenizerWrapper
 
 // Imports for token generation logic
-use ndarray::{ArrayD, Array2}; // s is not used yet, but Array2 is crucial
+use ndarray::{s, ArrayD, Array2, Axis, ArrayView1}; // Added s and Axis, ArrayView1
 use crate::model::{GPT2Model, GPT2Config};
 use crate::common::ModelKVCache;
 // Removed: use crate::tokenizer::GPT2Tokenizer; 
@@ -53,39 +53,73 @@ pub fn generate_next_token(
     last_token_id: u32,
     model_cache: &mut ModelKVCache,
     theta_hat: f32,
-) -> Result<(u32, ArrayD<f32>), String> {
+) -> Result<ArrayD<f32>, String> { // Changed return type
     let token_array = Array2::from_shape_vec((1, 1), vec![last_token_id as i32])
         .map_err(|e| format!("Failed to create Array2 from last_token_id: {}", e))?;
-    let model_output = model.forward(&token_array, model_cache, theta_hat)
-        .map_err(|e| format!("Model forward pass failed during next token generation: {}", e))?;
-    
-    let vocab_size = config.vocab_size as usize;
-    let dummy_logits_vec: Vec<f32> = (0..vocab_size).map(|idx| idx as f32).collect();
-    if dummy_logits_vec.is_empty() {
-        return Err("Dummy logits vector was empty (vocab_size might be 0).".to_string());
-    }
-    let next_token_id = dummy_logits_vec.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx as u32)
-        .ok_or_else(|| "Failed to determine next token from dummy logits.".to_string())?;
-    Ok((next_token_id, model_output))
+    // model.forward is assumed to return raw logits (or hidden_states as placeholder)
+    model.forward(&token_array, model_cache, theta_hat)
+        .map_err(|e| format!("Model forward pass failed during next token generation: {}", e))
 }
 
-fn get_greedy_token_from_arrayd(
-    _logits_array: &ArrayD<f32>, 
-    vocab_size: usize,
-) -> Result<u32, String> {
-    let dummy_logits_vec: Vec<f32> = (0..vocab_size).map(|idx| idx as f32).collect();
-    if dummy_logits_vec.is_empty() {
-        return Err("Dummy logits vector was empty in get_greedy_token (vocab_size might be 0).".to_string());
+// Helper to get a 1D view of the last sequence element's logits
+fn get_last_token_logits_slice(logits: &ArrayD<f32>) -> Option<ArrayView1<f32>> {
+    match logits.ndim() {
+        1 => Some(logits.view().into_dimensionality().unwrap()), // Already 1D
+        3 => { // Assuming [batch, seq_len, vocab_size]
+            if logits.shape()[0] == 0 || logits.shape()[1] == 0 || logits.shape()[2] == 0 {
+                None // Empty dimension
+            } else {
+                Some(logits.slice(s![logits.shape()[0]-1, logits.shape()[1]-1, ..]))
+            }
+        }
+        _ => None, // Unexpected number of dimensions
     }
-    dummy_logits_vec.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx as u32)
-        .ok_or_else(|| "Failed to determine token from dummy logits in get_greedy_token.".to_string())
 }
+
+/// Returns the top k tokens and their logit values from a logits array.
+/// Logits are assumed to be for a single token position (e.g., last token in a sequence).
+pub fn get_top_k_tokens(logits: &ArrayD<f32>, k: usize) -> Vec<(u32, f32)> {
+    if k == 0 {
+        return Vec::new();
+    }
+
+    let logits_slice_option = get_last_token_logits_slice(logits);
+    if logits_slice_option.is_none() {
+        return Vec::new();
+    }
+    let logits_slice = logits_slice_option.unwrap();
+
+    if logits_slice.is_empty() {
+        return Vec::new();
+    }
+    
+    let mut indexed_logits: Vec<(u32, f32)> = logits_slice.iter()
+        .enumerate()
+        .map(|(id, &logit_val)| (id as u32, logit_val))
+        .collect();
+
+    // Sort by logit value in descending order.
+    // Using partial_cmp for f32, handling potential NaNs by treating them as less than regular values.
+    indexed_logits.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less)
+    });
+
+    indexed_logits.truncate(k);
+    indexed_logits
+}
+
+
+/// Gets the token ID and logit value for the token with the highest logit score.
+/// Logits are assumed to be for a single token position.
+pub fn get_greedy_token_and_logit(logits: &ArrayD<f32>) -> Result<(u32, f32), String> {
+    let top_k = get_top_k_tokens(logits, 1);
+    if let Some(result) = top_k.first() {
+        Ok(*result)
+    } else {
+        Err("Failed to get greedy token: Logits processing resulted in empty list or k=0.".to_string())
+    }
+}
+
 
 /// Adjusts theta_hat based on user feedback and clamps it to the [0.0, 1.0] range.
 pub(crate) fn adjust_theta_hat(initial_theta: f32, user_feedback: &str) -> f32 {
@@ -121,13 +155,30 @@ pub fn run_repl_loop(
     let prefill_output_array = prefill_prompt(
         model, config, &current_token_ids, &mut model_cache, current_theta_hat
     )?;
-    let mut next_token_id = get_greedy_token_from_arrayd(
-        &prefill_output_array, config.vocab_size as usize
-    )?;
+
+    // Use the new get_greedy_token_and_logit function
+    // Process prefill output to get the first generated token
+    let (first_generated_token_id, first_dominant_logit) = get_greedy_token_and_logit(&prefill_output_array)?;
+    let first_top_k_alternatives = get_top_k_tokens(&prefill_output_array, 4); // Get top 4 for up to 3 alternatives
+    
+    let mut next_token_id = first_generated_token_id;
     current_token_ids.push(next_token_id);
+
+    // Variables to hold current iteration's logit info for display
+    let mut dominant_logit_value_for_display = first_dominant_logit;
+    let mut top_k_alternatives_for_display = first_top_k_alternatives;
     
     for i in 0..max_new_tokens {
-        let token_display_id = next_token_id;
+        let token_display_id = next_token_id; // This is the token generated in the previous step (or from prefill)
+        
+        // Decode the token for display
+        let token_str_display = tokenizer.decode(&[token_display_id], true)
+            .unwrap_or_else(|e| {
+                eprintln!("\n[Warning: Failed to decode token ID {}: {}]", token_display_id, e);
+                format!("[ID:{}]", token_display_id)
+            });
+
+        // --- User Validation for `token_display_id` ---
         print!("Validate token {}: (s)atisfied, (n)ot satisfied, (q)uit? ", token_display_id);
         io::stdout().flush().expect("Failed to flush stdout.");
         let mut user_feedback = String::new();
@@ -137,21 +188,26 @@ pub fn run_repl_loop(
         let pre_adjustment_theta = current_theta_hat; 
         let mut validation_status_str: String; 
 
-        // Decode the token for display before asking for validation
-        let token_str_display = tokenizer.decode(&[token_display_id], true) // true = skip special tokens
-            .unwrap_or_else(|e| {
-                eprintln!("\n[Warning: Failed to decode token ID {}: {}]", token_display_id, e);
-                format!("[ID:{}]", token_display_id) // Fallback
-            });
-
         if user_feedback == "q" {
             println!("Quitting generation loop.");
             validation_status_str = "quit".to_string();
+            // Display info for the token that led to quit
             println!(
-                "⟳ [{}] token: \"{}\" (ID: {}) | θ̂: {:.2} | validado: {}",
-                i, token_str_display, token_display_id, pre_adjustment_theta, validation_status_str
+                "⟳ [{}] token: \"{}\" (ID: {}, Logit: {:.2}) | θ̂: {:.2} | validado: {}",
+                i, token_str_display, token_display_id, dominant_logit_value_for_display, pre_adjustment_theta, validation_status_str
             );
-            break;
+            // Alternatives for the quit token
+            println!("  Alternatives for quit token (ID: {}):", token_display_id);
+            let mut alternatives_shown_quit = 0;
+            for (alt_id, alt_logit) in top_k_alternatives_for_display.iter() {
+                if *alt_id != token_display_id && alternatives_shown_quit < 3 {
+                    let alt_token_str = tokenizer.decode(&[*alt_id], true).unwrap_or_else(|_e| format!("[ID:{}]", alt_id));
+                    println!("    Alt {}: \"{}\" (ID: {}, Logit: {:.2})", alternatives_shown_quit + 1, alt_token_str, alt_id, alt_logit);
+                    alternatives_shown_quit += 1;
+                }
+                if alternatives_shown_quit >= 3 { break; }
+            }
+            break; // Exit the loop
         }
         
         current_theta_hat = adjust_theta_hat(current_theta_hat, &user_feedback);
@@ -163,15 +219,13 @@ pub fn run_repl_loop(
 
                 let context_tokens_for_exp = if current_token_ids.len() > 1 {
                     current_token_ids[..current_token_ids.len()-1].to_vec()
-                } else {
-                    Vec::new() 
-                };
+                } else { Vec::new() };
 
                 let entry = ExperienceEntry {
                     prompt_tokens: context_tokens_for_exp,
                     generated_token_id: token_display_id, 
                     validation_status: validation_bool,
-                    theta_hat_at_generation: current_theta_hat, 
+                    theta_hat_at_generation: pre_adjustment_theta, // Theta used to generate this token
                 };
                 store.add_experience(entry);
                 if let Err(e) = store.save() {
@@ -183,23 +237,48 @@ pub fn run_repl_loop(
             }
         }
         
+        // Display validated token info
         println!(
-            "⟳ [{}] token: \"{}\" (ID: {}) | θ̂: {:.2} | validado: {}",
-            i, token_str_display, token_display_id, current_theta_hat, validation_status_str
+            "⟳ [{}] token: \"{}\" (ID: {}, Logit: {:.2}) | θ̂: {:.2} | validado: {}",
+            i, token_str_display, token_display_id, dominant_logit_value_for_display, current_theta_hat, validation_status_str
         );
+        // Display alternatives
+        println!("  Alternatives:");
+        let mut alternatives_shown = 0;
+        for (alt_id, alt_logit) in top_k_alternatives_for_display.iter() {
+            if *alt_id != token_display_id && alternatives_shown < 3 {
+                let alt_token_str = tokenizer.decode(&[*alt_id], true).unwrap_or_else(|_e| format!("[ID:{}]", alt_id));
+                println!("    Alt {}: \"{}\" (ID: {}, Logit: {:.2})", alternatives_shown + 1, alt_token_str, alt_id, alt_logit);
+                alternatives_shown += 1;
+            }
+            if alternatives_shown >= 3 { break; }
+        }
+
 
         if token_display_id == eos_token_id {
             println!("EOS token ({}) encountered. Stopping generation.", eos_token_id);
             break;
         }
         
+        // Prepare for next iteration (if not the last one)
         if i < max_new_tokens - 1 {
-            let last_token_id_for_gen = token_display_id;
-            let (generated_token_id, _generated_output_array) = generate_next_token(
+            let last_token_id_for_gen = token_display_id; // The token we just processed
+            
+            // Generate logits for the *next* token
+            let next_logits = generate_next_token(
                 model, config, last_token_id_for_gen, &mut model_cache, current_theta_hat
             )?;
-            next_token_id = generated_token_id;
+            
+            // Determine the next token and its logit info based on these new logits
+            let (chosen_next_token_id, next_dominant_logit) = get_greedy_token_and_logit(&next_logits)?;
+            let next_top_k_alternatives = get_top_k_tokens(&next_logits, 4);
+
+            next_token_id = chosen_next_token_id;
             current_token_ids.push(next_token_id);
+
+            // Update logit info for the display in the *next* iteration
+            dominant_logit_value_for_display = next_dominant_logit;
+            top_k_alternatives_for_display = next_top_k_alternatives;
         }
     }
 
@@ -379,23 +458,94 @@ mod tests {
         }
         
         #[test]
-        fn test_get_greedy_token_from_arrayd_basic() {
-            let dummy_array = ArrayD::zeros(IxDyn(&[1,1,128]));
-            let vocab_size = 50257;
-            let token_id = get_greedy_token_from_arrayd(&dummy_array, vocab_size).unwrap();
-            assert_eq!(token_id, 0); 
-            let vocab_size_small = 10;
-            let token_id_small = get_greedy_token_from_arrayd(&dummy_array, vocab_size_small).unwrap();
-            assert_eq!(token_id_small, 0);
+        fn test_get_greedy_token_and_logit_basic() {
+            // Test with 1D array
+            let logits_1d = ArrayD::from_shape_vec(IxDyn(&[5]), vec![0.1, 0.2, 0.5, 0.1, 0.1]).unwrap();
+            let (token_id, logit_val) = get_greedy_token_and_logit(&logits_1d).unwrap();
+            assert_eq!(token_id, 2);
+            assert!((logit_val - 0.5).abs() < f32::EPSILON);
+
+            // Test with 3D array (e.g., model output [1,1,V])
+            let logits_3d = ArrayD::from_shape_vec(IxDyn(&[1, 1, 5]), vec![0.1, 0.8, 0.5, 0.1, 0.1]).unwrap();
+            let (token_id_3d, logit_val_3d) = get_greedy_token_and_logit(&logits_3d).unwrap();
+            assert_eq!(token_id_3d, 1);
+            assert!((logit_val_3d - 0.8).abs() < f32::EPSILON);
+
+            // Test with another 3D array, last element in seq
+             let logits_3d_long_seq = ArrayD::from_shape_vec(IxDyn(&[1, 3, 5]), 
+                vec![0.1, 0.2, 0.3, 0.4, 0.0, // seq 0
+                     0.0, 0.0, 0.0, 0.0, 0.0, // seq 1
+                     0.1, 0.8, 0.5, 0.1, 0.1  // seq 2 (last one)
+                    ]).unwrap();
+            let (token_id_3d_ls, logit_val_3d_ls) = get_greedy_token_and_logit(&logits_3d_long_seq).unwrap();
+            assert_eq!(token_id_3d_ls, 1); // from last sequence element
+            assert!((logit_val_3d_ls - 0.8).abs() < f32::EPSILON);
         }
 
         #[test]
-        fn test_get_greedy_token_from_arrayd_empty_vocab() {
-            let dummy_array = ArrayD::zeros(IxDyn(&[1,1,128]));
-            let vocab_size = 0;
-            let result = get_greedy_token_from_arrayd(&dummy_array, vocab_size);
-            assert!(result.is_err());
+        fn test_get_greedy_token_and_logit_empty_or_invalid() {
+            let empty_logits_1d = ArrayD::from_shape_vec(IxDyn(&[0]), vec![]).unwrap();
+            assert!(get_greedy_token_and_logit(&empty_logits_1d).is_err());
+            
+            let empty_logits_3d = ArrayD::from_shape_vec(IxDyn(&[1,1,0]), vec![]).unwrap();
+            assert!(get_greedy_token_and_logit(&empty_logits_3d).is_err());
+
+            let invalid_shape_logits = ArrayD::zeros(IxDyn(&[1,1,1,1])); // 4D
+             assert!(get_greedy_token_and_logit(&invalid_shape_logits).is_err());
         }
+
+        #[test]
+        fn test_get_top_k_tokens_basic() {
+            let logits_1d = ArrayD::from_shape_vec(IxDyn(&[5]), vec![0.1, 0.7, 0.5, 0.9, 0.3]).unwrap();
+            // Expected sorted: (3, 0.9), (1, 0.7), (2, 0.5), (4, 0.3), (0, 0.1)
+            
+            let top_1 = get_top_k_tokens(&logits_1d, 1);
+            assert_eq!(top_1.len(), 1);
+            assert_eq!(top_1[0].0, 3); // token id
+            assert!((top_1[0].1 - 0.9).abs() < f32::EPSILON); // logit value
+
+            let top_3 = get_top_k_tokens(&logits_1d, 3);
+            assert_eq!(top_3.len(), 3);
+            assert_eq!(top_3[0].0, 3);
+            assert_eq!(top_3[1].0, 1);
+            assert_eq!(top_3[2].0, 2);
+            assert!((top_3[0].1 - 0.9).abs() < f32::EPSILON);
+            assert!((top_3[1].1 - 0.7).abs() < f32::EPSILON);
+            assert!((top_3[2].1 - 0.5).abs() < f32::EPSILON);
+
+            // K larger than vocab size
+            let top_10 = get_top_k_tokens(&logits_1d, 10);
+            assert_eq!(top_10.len(), 5); // Should return all available, sorted
+            assert_eq!(top_10[0].0, 3);
+            assert_eq!(top_10[4].0, 0);
+
+            // K = 0
+            let top_0 = get_top_k_tokens(&logits_1d, 0);
+            assert!(top_0.is_empty());
+        }
+
+        #[test]
+        fn test_get_top_k_tokens_3d() {
+            let logits_3d = ArrayD::from_shape_vec(IxDyn(&[1, 1, 5]), vec![0.1, 0.7, 0.5, 0.9, 0.3]).unwrap();
+            // Expected sorted: (3, 0.9), (1, 0.7), (2, 0.5), (4, 0.3), (0, 0.1)
+            let top_2 = get_top_k_tokens(&logits_3d, 2);
+            assert_eq!(top_2.len(), 2);
+            assert_eq!(top_2[0].0, 3);
+            assert_eq!(top_2[1].0, 1);
+        }
+
+        #[test]
+        fn test_get_top_k_tokens_empty_or_invalid() {
+            let empty_logits_1d = ArrayD::from_shape_vec(IxDyn(&[0]), vec![]).unwrap();
+            assert!(get_top_k_tokens(&empty_logits_1d, 3).is_empty());
+
+            let empty_logits_3d = ArrayD::from_shape_vec(IxDyn(&[1,1,0]), vec![]).unwrap();
+            assert!(get_top_k_tokens(&empty_logits_3d, 3).is_empty());
+            
+            let invalid_shape_logits = ArrayD::zeros(IxDyn(&[2,2])); // 2D
+            assert!(get_top_k_tokens(&invalid_shape_logits, 3).is_empty());
+        }
+
 
         #[test]
         #[ignore] 
