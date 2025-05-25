@@ -167,7 +167,7 @@ mod tests {
         let mut entry2 = ExperienceEntry::new("P2".to_string(), "R2".to_string());
         entry2.validation_status = ValidationStatus::Rejected;
         let entry3 = ExperienceEntry::new("P3".to_string(), "R3".to_string()); // Unvalidated
-        let entry4 = ExperienceEntry::new("P4".to_string(), "R4".to_string());
+        let mut entry4 = ExperienceEntry::new("P4".to_string(), "R4".to_string());
         entry4.validation_status = ValidationStatus::Accepted;
 
 
