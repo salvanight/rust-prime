@@ -105,7 +105,7 @@ pub fn generate(
 
         // b. Call model.forward()
         // Logits tensor shape: `[1, current_sequence_length, vocab_size]`.
-        let logits_tensor = model.forward(&input_tensor, None)?;
+        let logits_tensor = model.forward(&input_tensor, None, None, None)?;
 
         // c. Extract logits for the *last token*
         // Logits for the last token are at the end of the `data` Vec.
