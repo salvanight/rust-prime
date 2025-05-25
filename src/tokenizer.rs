@@ -216,6 +216,80 @@ impl TokenizerWrapper {
         Ok(Self { tokenizer })
     }
 
+    /// Creates a new `TokenizerWrapper` by loading a base GPT-2 tokenizer and then
+    /// adding a list of custom symbolic tokens.
+    ///
+    /// This is useful for scenarios where a standard GPT-2 model needs to be augmented
+    /// with specific symbols or control tokens (e.g., `"[USER]"`, `"[ASSISTANT]"`, `"[END_OF_TURN]"`).
+    /// These symbols are added as special, single-word tokens that will not be split by
+    /// the BPE model and will bypass some normalization steps.
+    ///
+    /// The base GPT-2 tokenizer is loaded from default paths:
+    /// - Vocab: `resources/tokenizer_data/gpt2/gpt2-vocab.json`
+    /// - Merges: `resources/tokenizer_data/gpt2/merges.txt`
+    /// (Relative to `CARGO_MANIFEST_DIR`).
+    ///
+    /// After loading the base tokenizer, the provided `symbols_to_add` are registered.
+    /// Their assigned token IDs can be retrieved using methods like `tokenizer.token_to_id(symbol)`.
+    ///
+    /// # Parameters
+    /// - `symbols_to_add`: A slice of string slices, where each string is a new symbolic token
+    ///   to be added to the GPT-2 tokenizer.
+    ///
+    /// # Returns
+    /// - `Ok(Self)`: A new `TokenizerWrapper` instance with the base GPT-2 tokenizer augmented
+    ///   with the specified symbolic tokens.
+    /// - `Err(TokenizerError)`: If loading the base GPT-2 tokenizer fails, or if adding
+    ///   the new symbolic tokens fails. Possible error types include `TokenizerError::FailedToLoad`
+    ///   (if vocab/merges paths are problematic or files are missing/corrupt) or
+    ///   `TokenizerError::Library` (if BPE model building or adding tokens fails).
+    pub fn from_symbolic_gpt2(symbols_to_add: &[&str]) -> Result<Self, TokenizerError> {
+        let base_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let vocab_path = base_dir.join("resources/tokenizer_data/gpt2/gpt2-vocab.json");
+        let merges_path = base_dir.join("resources/tokenizer_data/gpt2/merges.txt");
+
+        #[cfg(feature = "tokenizer-debug-logs")]
+        debug!(
+            "Creating symbolic GPT-2 tokenizer. Base vocab: {:?}, base merges: {:?}, symbols to add: {:?}",
+            vocab_path, merges_path, symbols_to_add
+        );
+
+        if !vocab_path.exists() {
+            return Err(TokenizerError::FailedToLoad { path: vocab_path, source_message: "GPT-2 vocab file not found.".to_string() });
+        }
+        if !merges_path.exists() {
+            return Err(TokenizerError::FailedToLoad { path: merges_path, source_message: "GPT-2 merges file not found.".to_string() });
+        }
+
+        let mut tokenizer_wrapper = Self::from_gpt2_files(&vocab_path, &merges_path)?;
+
+        if !symbols_to_add.is_empty() {
+            let added_tokens: Vec<AddedToken> = symbols_to_add
+                .iter()
+                .map(|s| AddedToken::from(*s, true).special(true)) // `true` for single_word, .special(true) to ensure it's treated as special
+                .collect();
+            
+            #[cfg(feature = "tokenizer-debug-logs")]
+            debug!("Adding symbolic tokens to GPT-2 base: {:?}", added_tokens);
+
+            match tokenizer_wrapper.add_new_tokens(&added_tokens) {
+                Ok(num_added) => {
+                    #[cfg(feature = "tokenizer-debug-logs")]
+                    trace!("Successfully added {} symbolic tokens.", num_added);
+                }
+                Err(e) => {
+                    #[cfg(feature = "tokenizer-debug-logs")]
+                    warn!("Failed to add symbolic tokens: {}", e);
+                    return Err(e); // Propagate the error
+                }
+            }
+        }
+        
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!("Successfully created symbolic GPT-2 tokenizer.");
+        Ok(tokenizer_wrapper)
+    }
+
 
     /// Encodes a given text string into a sequence of token IDs.
     ///
@@ -365,6 +439,25 @@ impl TokenizerWrapper {
         #[cfg(feature = "tokenizer-debug-logs")]
         trace!("Successfully added {} tokens. New vocab size: {}", num_added, self.tokenizer.get_vocab_size(true));
         Ok(num_added)
+    }
+
+    /// Retrieves the numerical ID of a given token string (symbol) from the tokenizer's vocabulary.
+    ///
+    /// This method can be used to find the ID for any token known to the tokenizer,
+    /// including standard vocabulary tokens and custom symbols that might have been
+    /// added via methods like `add_new_tokens` or constructors like `from_symbolic_gpt2`.
+    ///
+    /// # Parameters
+    /// - `symbol`: The token string (e.g., "hello", "<|endoftext|>", `"[USER_PROMPT]"`) whose ID is to be retrieved.
+    ///
+    /// # Returns
+    /// - `Some(u32)`: If the token is found in the vocabulary, containing its numerical ID.
+    /// - `None`: If the token is not found in the vocabulary.
+    pub fn get_symbol_id(&self, symbol: &str) -> Option<u32> {
+        let result = self.tokenizer.token_to_id(symbol);
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!("Looking up ID for symbol: '{}', Found: {:?}", symbol, result);
+        result
     }
 }
 
@@ -743,6 +836,174 @@ mod gpt2_integration_tests {
         let text_simple_mixed = "mycustomtokenXYZ<|anotherspecialtok|>"; // No space, direct concatenation
         let encoded_simple_mixed = wrapper.encode(text_simple_mixed, false, None).unwrap();
         assert_eq!(encoded_simple_mixed, vec![id_custom, id_special_new], "Encoding simple mixed new tokens failed.");
+    }
+
+    #[test]
+    fn test_get_symbol_id() {
+        let mut wrapper = load_gpt2_tokenizer_for_test();
+
+        // Test known tokens from GPT-2 vocab
+        assert_eq!(wrapper.get_symbol_id("hello"), Some(31373), "ID for 'hello' mismatch.");
+        assert_eq!(wrapper.get_symbol_id("<|endoftext|>"), Some(50256), "ID for '<|endoftext|>' mismatch.");
+        
+        // Test a token that includes a space prefix (handled by ByteLevel BPE)
+        // The token " world" (with a leading space) is ID 995.
+        // `get_symbol_id` looks for the exact string in the vocab. The vocab contains "Ġworld".
+        // The ByteLevel pretokenizer converts " world" to "Ġworld" before BPE lookup.
+        // So, to get ID 995, we should lookup "Ġworld".
+        assert_eq!(wrapper.get_symbol_id("Ġworld"), Some(995), "ID for 'Ġworld' mismatch.");
+
+        // Test non-existent token
+        assert_eq!(wrapper.get_symbol_id("nonexistenttoken123"), None, "ID for non-existent token should be None.");
+
+        // Test after adding a new token
+        let initial_vocab_size = wrapper.get_vocab_size(); // 50257
+        let new_symbol = "[USER_PROMPT]";
+        let added_tokens = [AddedToken::from(new_symbol, true).special(true)];
+        wrapper.add_new_tokens(&added_tokens).expect("Failed to add new symbolic token");
+        
+        assert_eq!(wrapper.get_vocab_size(), initial_vocab_size + 1, "Vocab size should increment after adding token.");
+        assert_eq!(wrapper.get_symbol_id(new_symbol), Some(initial_vocab_size), "ID for newly added symbolic token is incorrect.");
+
+        // Test another non-existent token after adding one
+        assert_eq!(wrapper.get_symbol_id("anothernonexistent"), None, "ID for another non-existent token should be None after add.");
+    }
+
+    #[test]
+    fn test_from_symbolic_gpt2_basic_workflow() {
+        let symbols = ["<SYMBOL_A>", "<SYMBOL_B>"];
+        let mut wrapper = TokenizerWrapper::from_symbolic_gpt2(&symbols)
+            .expect("Failed to load symbolic GPT-2 tokenizer.");
+
+        let base_vocab_size = 50257; // Standard GPT-2
+        assert_eq!(wrapper.get_vocab_size(), base_vocab_size + 2, "Vocab size mismatch after adding symbols.");
+
+        let id_a = wrapper.get_symbol_id("<SYMBOL_A>");
+        let id_b = wrapper.get_symbol_id("<SYMBOL_B>");
+        assert!(id_a.is_some(), "Symbol A not found.");
+        assert!(id_b.is_some(), "Symbol B not found.");
+        assert_eq!(id_a, Some(base_vocab_size), "ID for SYMBOL_A is incorrect.");
+        assert_eq!(id_b, Some(base_vocab_size + 1), "ID for SYMBOL_B is incorrect.");
+
+        let text = "This uses <SYMBOL_A> and also <SYMBOL_B>.";
+        // "This" -> 1212
+        // " uses" -> 1243
+        // " <SYMBOL_A>" -> Ġ<SYMBOL_A> (ByteLevel will make this "Ġ" + "<SYMBOL_A>")
+        // Since <SYMBOL_A> is added as special, it should be tokenized as itself.
+        // The space before it will be "Ġ".
+        // " and" -> 290 (conflicts with " you", let's check. " and" is 290, " you" is 345) -> " and" is 290.
+        // " also" -> 1004
+        // " <SYMBOL_B>" -> "Ġ" + "<SYMBOL_B>"
+        // "." -> 13
+
+        // Corrected encoding based on how ByteLevel and added special tokens work:
+        // "This" -> 1212
+        // " uses" -> 1243
+        // " " -> "Ġ" (GPT-2 ID for Ġ is 198, if it's not merged. Or handled by ByteLevel)
+        // "<SYMBOL_A>" -> id_a.unwrap()
+        // " and" -> 290
+        // " also" -> 1004
+        // " " -> "Ġ"
+        // "<SYMBOL_B>" -> id_b.unwrap()
+        // "." -> 13
+        
+        // Let's verify parts:
+        // "This uses " -> [1212, 1243, 220] (220 is space " ")
+        // " and also " -> [290, 1004, 220]
+        // "." -> [13]
+
+        let ids_this_uses = wrapper.encode("This uses ", false, None).unwrap();
+        let ids_and_also = wrapper.encode(" and also ", false, None).unwrap();
+        let ids_period = wrapper.encode(".", false, None).unwrap();
+
+        let mut expected_ids: Vec<u32> = Vec::new();
+        expected_ids.extend(ids_this_uses);
+        expected_ids.push(id_a.unwrap());
+        expected_ids.extend(ids_and_also);
+        expected_ids.push(id_b.unwrap());
+        expected_ids.extend(ids_period);
+        
+        let encoded_result = wrapper.encode(text, false, None);
+        assert!(encoded_result.is_ok(), "Encoding with symbolic tokens failed: {:?}", encoded_result.err());
+        let encoded_ids = encoded_result.unwrap();
+        assert_eq!(encoded_ids, expected_ids, "Encoded IDs for symbolic sentence mismatch.");
+
+        let decoded_text = wrapper.decode(&encoded_ids, false).expect("Decoding symbolic sentence failed");
+        assert_eq!(decoded_text, text, "Decoded symbolic sentence does not match original.");
+    }
+
+    #[test]
+    fn test_from_symbolic_gpt2_empty_symbols_list() {
+        let wrapper = TokenizerWrapper::from_symbolic_gpt2(&[])
+            .expect("Failed to load symbolic GPT-2 with empty symbols list.");
+        
+        assert_eq!(wrapper.get_vocab_size(), 50257, "Vocab size should be standard GPT-2 for empty symbols.");
+
+        let text = "hello world";
+        let encoded_ids = wrapper.encode(text, false, None).unwrap();
+        assert_eq!(encoded_ids, vec![31373, 995], "Encoding with base GPT-2 (from symbolic empty) failed.");
+    }
+
+    #[test]
+    fn test_from_symbolic_gpt2_symbol_overlap_handling() {
+        // "<|endoftext|>" is a real GPT-2 token (ID 50256)
+        // "world" is part of "Ġworld" (ID 995)
+        let symbols = ["world", "new_hello_world", "<|endoftext|>custom"];
+        let mut wrapper = TokenizerWrapper::from_symbolic_gpt2(&symbols)
+            .expect("Failed to load symbolic GPT-2 for overlap test.");
+
+        let base_vocab_size = 50257;
+        assert_eq!(wrapper.get_vocab_size(), base_vocab_size + 3);
+
+        let id_world_new = wrapper.get_symbol_id("world").expect("New 'world' symbol not found");
+        let id_new_hello_world = wrapper.get_symbol_id("new_hello_world").expect("Symbol 'new_hello_world' not found");
+        let id_eot_custom = wrapper.get_symbol_id("<|endoftext|>custom").expect("Symbol '<|endoftext|>custom' not found");
+
+        assert_eq!(id_world_new, base_vocab_size);
+        assert_eq!(id_new_hello_world, base_vocab_size + 1);
+        assert_eq!(id_eot_custom, base_vocab_size + 2);
+
+        // Test that the new "world" token is distinct from how GPT-2 might tokenize "world" or " world"
+        // " world" (GPT-2 token) -> [995] ("Ġworld")
+        // "world" (new symbol) -> [id_world_new]
+        let encoded_gpt2_world = wrapper.encode(" world", false, None).unwrap(); // Should use original Ġworld
+        assert_eq!(encoded_gpt2_world, vec![995]);
+
+        let encoded_new_world = wrapper.encode("world", false, None).unwrap(); // Should use new symbol
+        assert_eq!(encoded_new_world, vec![id_world_new]);
+        
+        let text = "A new world and new_hello_world with <|endoftext|>custom.";
+        // "A" -> 32
+        // " new" -> 534
+        // " " -> 220 (space)
+        // "world" (new symbol) -> id_world_new
+        // " and" -> 290
+        // " " -> 220
+        // "new_hello_world" (new symbol) -> id_new_hello_world
+        // " with" -> 750
+        // " " -> 220
+        // "<|endoftext|>custom" (new symbol) -> id_eot_custom
+        // "." -> 13
+
+        let ids_A_new_space = wrapper.encode("A new ", false, None).unwrap(); // [32, 534, 220]
+        let ids_and_space = wrapper.encode(" and ", false, None).unwrap();   // [290, 220]
+        let ids_with_space = wrapper.encode(" with ", false, None).unwrap(); // [750, 220]
+        let ids_period = wrapper.encode(".", false, None).unwrap();         // [13]
+
+        let mut expected_ids: Vec<u32> = Vec::new();
+        expected_ids.extend(ids_A_new_space);
+        expected_ids.push(id_world_new);
+        expected_ids.extend(ids_and_space);
+        expected_ids.push(id_new_hello_world);
+        expected_ids.extend(ids_with_space);
+        expected_ids.push(id_eot_custom);
+        expected_ids.extend(ids_period);
+        
+        let encoded_result = wrapper.encode(text, false, None).unwrap();
+        assert_eq!(encoded_result, expected_ids, "Encoding overlap sentence failed.");
+
+        let decoded_text = wrapper.decode(&encoded_result, false).unwrap();
+        assert_eq!(decoded_text, text, "Decoding overlap sentence failed.");
     }
 }
 
