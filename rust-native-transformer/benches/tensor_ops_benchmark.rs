@@ -27,7 +27,7 @@ fn benchmark_matmul(c: &mut Criterion) {
         let b = create_random_tensor(vec![k, n], 1);
 
         group.bench_with_input(format!("Scalar MatMul {}x{}x{}", m, k, n), &(&a, &b), |bencher, (a_ref, b_ref)| {
-            bencher.iter(|| black_box(a_ref.matmul(b_ref).unwrap()));
+            bencher.iter(|| black_box(Tensor::matmul(a_ref, b_ref).unwrap()));
         });
 
         group.bench_with_input(format!("SIMD MatMul {}x{}x{}", m, k, n), &(&a, &b), |bencher, (a_ref, b_ref)| {
