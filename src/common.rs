@@ -26,10 +26,10 @@ impl LayerNorm {
     pub fn forward(&self, x: &ArrayD<f32>) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
         // Placeholder for LayerNorm forward pass
         // Actual implementation would normalize x using self.weight and self.bias
-        println!("LayerNorm forward called with tensor of shape: {:?}", x.shape());
-        // For now, just return a clone or a newly created dummy tensor
-        // Ok(x.clone()) // Simplest placeholder
-        todo!("Implement LayerNorm forward pass");
+        // println!("LayerNorm forward called with tensor of shape: {:?}", x.shape());
+        // For now, just return a clone for shape testing.
+        Ok(x.clone()) // Simplest placeholder
+        // todo!("Implement LayerNorm forward pass");
     }
 }
 

@@ -589,5 +589,46 @@ mod tests {
             // Test 'n' that would go below 0.0
             assert!((adjust_theta_hat(0.01, "n") - 0.0).abs() < f32::EPSILON); // 0.01 - 0.05 = -0.04 -> 0.0
         }
+
+        #[test]
+        fn test_get_last_token_logits_slice_logic() {
+            // Case 1: 1D tensor (e.g., already a slice)
+            let logits_1d = ArrayD::from_shape_vec(IxDyn(&[5]), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+            let slice_1d = get_last_token_logits_slice(&logits_1d).unwrap();
+            assert_eq!(slice_1d.to_vec(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+
+            // Case 2: 3D tensor (batch=1, seq=1, vocab_size=5)
+            let logits_3d_s1 = ArrayD::from_shape_vec(IxDyn(&[1, 1, 5]), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+            let slice_3d_s1 = get_last_token_logits_slice(&logits_3d_s1).unwrap();
+            assert_eq!(slice_3d_s1.to_vec(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+            
+            // Case 3: 3D tensor (batch=1, seq=3, vocab_size=2)
+            // Logits: [[[1,2], [3,4], [5,6]]]
+            let logits_3d_s3 = ArrayD::from_shape_vec(IxDyn(&[1, 3, 2]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+            let slice_3d_s3 = get_last_token_logits_slice(&logits_3d_s3).unwrap();
+            assert_eq!(slice_3d_s3.to_vec(), vec![5.0, 6.0]); // Should be the last slice [5.0, 6.0]
+
+            // Case 4: 3D tensor with batch_size > 1 (should take last batch, last seq)
+            // Logits: [ Batch0: [[1,2], [3,4]], Batch1: [[5,6], [7,8]] ]
+            let logits_3d_b2_s2 = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), vec![1.0,2.0, 3.0,4.0, 5.0,6.0, 7.0,8.0]).unwrap();
+            let slice_3d_b2_s2 = get_last_token_logits_slice(&logits_3d_b2_s2).unwrap();
+            assert_eq!(slice_3d_b2_s2.to_vec(), vec![7.0, 8.0]); // Last slice of last batch
+
+            // Case 5: Empty dimension in 3D tensor
+            let logits_3d_empty_vocab = ArrayD::from_shape_vec(IxDyn(&[1, 1, 0]), vec![]).unwrap();
+            assert!(get_last_token_logits_slice(&logits_3d_empty_vocab).is_none());
+            let logits_3d_empty_seq = ArrayD::from_shape_vec(IxDyn(&[1, 0, 5]), vec![]).unwrap();
+            assert!(get_last_token_logits_slice(&logits_3d_empty_seq).is_none());
+            let logits_3d_empty_batch = ArrayD::from_shape_vec(IxDyn(&[0, 1, 5]), vec![]).unwrap();
+            assert!(get_last_token_logits_slice(&logits_3d_empty_batch).is_none());
+
+            // Case 6: Unexpected number of dimensions (e.g., 2D)
+            let logits_2d = ArrayD::from_shape_vec(IxDyn(&[2, 2]), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+            assert!(get_last_token_logits_slice(&logits_2d).is_none());
+
+            // Case 7: Unexpected number of dimensions (e.g., 4D)
+            let logits_4d = ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 2]), vec![1.0, 2.0]).unwrap();
+            assert!(get_last_token_logits_slice(&logits_4d).is_none());
+        }
     }
 }
