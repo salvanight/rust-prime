@@ -42,6 +42,11 @@ impl TransformerBlock {
     }
 }
 
+/// Represents the GPT-2 model architecture and its parameters.
+///
+/// This struct holds the model's layers (attention, MLP, layer normalization)
+/// and provides methods for forward passes and other model-specific operations.
+/// It now also stores its `GPT2Config`.
 #[derive(Debug)]
 pub struct GPT2Model {
     config: GPT2Config, // Added config field
@@ -52,7 +57,17 @@ pub struct GPT2Model {
 }
 
 impl GPT2Model {
-    pub fn new(config: &GPT2Config) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Creates a new instance of `GPT2Model` based on the provided configuration.
+    ///
+    /// Initializes all layers and parameters of the model according to `GPT2Config`.
+    /// The provided `config` is stored within the model instance for later reference (e.g., by `get_embeddings`).
+    ///
+    /// # Arguments
+    /// * `config`: A reference to the `GPT2Config` specifying the model's architecture.
+    ///
+    /// # Returns
+    /// A `Result` containing the initialized `GPT2Model` or an error string if initialization fails.
+    pub fn new(config: &GPT2Config) -> Result<Self, Box<dyn std::error::Error>> { // Return type kept as Box<dyn Error> from existing code
         let wte_weight = ArrayD::zeros((config.vocab_size as usize, config.n_embd as usize).into_dyn());
         let wpe_weight = ArrayD::zeros((config.n_positions as usize, config.n_embd as usize).into_dyn());
         
@@ -72,6 +87,19 @@ impl GPT2Model {
         })
     }
 
+    /// Retrieves the token embeddings for a given sequence of token IDs.
+    ///
+    /// **Note:** This is currently a placeholder implementation and returns zeros
+    /// of the expected shape. A full implementation would use the model's
+    /// word token embeddings (`wte`) and word position embeddings (`wpe`).
+    ///
+    /// # Arguments
+    /// * `tokens`: A slice of `u32` token IDs for which to retrieve embeddings.
+    ///
+    /// # Returns
+    /// A `Result` containing an `ArrayD<f32>` with the shape `[1, num_tokens, n_embd]`
+    /// representing the embeddings, or an error string if `tokens` is empty or
+    /// another issue occurs.
     pub fn get_embeddings(&self, tokens: &[u32]) -> Result<ArrayD<f32>, String> {
         // Placeholder implementation - actual embedding lookup would happen here.
         // For now, returns zeros of the expected shape [1, num_tokens, n_embd].
