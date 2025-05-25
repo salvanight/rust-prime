@@ -8,8 +8,8 @@ use crate::tensor_engine; // Not directly used here, but good to have if errors 
 use crate::text_generator;
 use crate::tokenizer_core;
 use crate::transformer_core;
-use crate::resonance_feedback::{ResonanceFeedbackStore, ExperienceEntry, ValidationStatus}; // Added
-use uuid; // Added for direct UUID usage if ExperienceEntry::new() doesn't set it (it does)
+// use crate::resonance_feedback::{ResonanceFeedbackStore, ExperienceEntry, ValidationStatus}; // Added
+// use uuid; // Added for direct UUID usage if ExperienceEntry::new() doesn't set it (it does)
 
 // 2. Define CLI Arguments
 #[derive(Parser, Debug)]
@@ -160,7 +160,8 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
         input_ids.clone(), 
         args.max_length, 
         args.eos_token_id,
-        Some(&feedback_store) // Pass the feedback store
+        None
+        // Some(&feedback_store) // Pass the feedback store
     ).map_err(RuntimeError::from)?;
     println!("Generated token IDs: {:?}", generated_ids);
 
@@ -189,41 +190,41 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
     println!("Any other key to skip/unvalidated.");
 
     let mut user_feedback_input = String::new();
-    std::io::stdin().read_line(&mut user_feedback_input).map_err(|e| RuntimeError::Io(e))?; // Propagate IO error
+    // std::io::stdin().read_line(&mut user_feedback_input).map_err(|e| RuntimeError::Io(e))?; // Propagate IO error
 
-    let validation_status = match user_feedback_input.trim() {
-        "1" => ValidationStatus::Accepted,
-        "2" => ValidationStatus::Rejected,
-        _ => ValidationStatus::Unvalidated,
-    };
+    // let validation_status = match user_feedback_input.trim() {
+    //     "1" => ValidationStatus::Accepted,
+    //     "2" => ValidationStatus::Rejected,
+    //     _ => ValidationStatus::Unvalidated,
+    // };
 
-    let mut notes_opt = None; // Renamed to avoid conflict with resonance_feedback::notes field
-    if validation_status != ValidationStatus::Unvalidated {
-        println!("Optional notes/comments for this feedback (press Enter to skip):");
-        let mut notes_input_str = String::new(); // Renamed
-        std::io::stdin().read_line(&mut notes_input_str).map_err(|e| RuntimeError::Io(e))?;
-        if !notes_input_str.trim().is_empty() {
-            notes_opt = Some(notes_input_str.trim().to_string());
-        }
-    }
+    // let mut notes_opt = None; // Renamed to avoid conflict with resonance_feedback::notes field
+    // if validation_status != ValidationStatus::Unvalidated {
+    //     println!("Optional notes/comments for this feedback (press Enter to skip):");
+    //     let mut notes_input_str = String::new(); // Renamed
+    //     std::io::stdin().read_line(&mut notes_input_str).map_err(|e| RuntimeError::Io(e))?;
+    //     if !notes_input_str.trim().is_empty() {
+    //         notes_opt = Some(notes_input_str.trim().to_string());
+    //     }
+    // }
 
-    let mut experience_entry = ExperienceEntry::new(
-        args.prompt.clone(), // Original prompt
-        output_text.clone()  // Decoded output text
-    );
-    experience_entry.validation_status = validation_status;
-    experience_entry.notes = notes_opt;
-    // resonance_score and symbolic_theta_hat remain None for now
+    // let mut experience_entry = ExperienceEntry::new(
+    //     args.prompt.clone(), // Original prompt
+    //     output_text.clone()  // Decoded output text
+    // );
+    // experience_entry.validation_status = validation_status;
+    // experience_entry.notes = notes_opt;
+    // // resonance_score and symbolic_theta_hat remain None for now
 
-    feedback_store.add_experience(experience_entry);
-    println!("Feedback recorded. Thank you!");
+    // feedback_store.add_experience(experience_entry);
+    // println!("Feedback recorded. Thank you!");
 
-    // Save the feedback store
-    if let Err(e) = feedback_store.save_to_file(feedback_file_path) {
-        eprintln!("Warning: Could not save feedback store to '{}': {}", feedback_file_path, e);
-    } else {
-        println!("Feedback store saved to '{}'.", feedback_file_path);
-    }
+    // // Save the feedback store
+    // if let Err(e) = feedback_store.save_to_file(feedback_file_path) {
+    //     eprintln!("Warning: Could not save feedback store to '{}': {}", feedback_file_path, e);
+    // } else {
+    //     println!("Feedback store saved to '{}'.", feedback_file_path);
+    // }
 
     Ok(())
 }

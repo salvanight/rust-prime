@@ -25,9 +25,10 @@ impl std::fmt::Display for TensorError {
 }
 
 // SIMD specific imports
-use std::simd::{f32x8, SimdFloat}; 
+// use std::simd::{f32x8, SimdFloat}; 
 
 impl Tensor<f32> {
+    /*
     pub fn gelu_simd(&self) -> Result<Tensor<f32>, TensorError> { // Changed to method
         let mut output_data = vec![0.0f32; self.data.len()]; // Use self
         let mut k_base = 0;
@@ -75,6 +76,7 @@ impl Tensor<f32> {
 
         Tensor::new(output_data, self.shape.clone()) // Use self
     }
+    */
 
     pub fn scalar_mul(&self, scalar: f32) -> Result<Tensor<f32>, TensorError> {
         if self.data.is_empty() && self.num_elements() == 0 { // Handle empty tensor
@@ -215,7 +217,7 @@ impl Tensor<f32> {
         Tensor::new(output_data, output_shape)
     }
 
-
+    /*
     pub fn matmul_simd(&self, other: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
         // 1. Shape checks (self is A, other is B)
         if self.rank() != 2 || other.rank() != 2 {
@@ -291,6 +293,7 @@ impl Tensor<f32> {
         // 16. Return Ok(Tensor::new(output_data, vec![M, N])?)
         Tensor::new(output_data, vec![m, n])
     }
+    */
 }
 
 impl std::error::Error for TensorError {} // Simple implementation, no source needed for these variants

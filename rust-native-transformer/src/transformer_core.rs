@@ -69,7 +69,7 @@ pub(crate) mod tensor_ops {
     use super::*;
 
     pub fn matmul(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
-        a.matmul_simd(b) 
+        Tensor::matmul(a, b) 
     }
 
     pub fn softmax(a: &Tensor<f32>, axis: usize) -> Result<Tensor<f32>, TensorError> {
@@ -81,7 +81,7 @@ pub(crate) mod tensor_ops {
     }
 
     pub fn gelu(a: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
-        a.gelu_simd() 
+        a.gelu() 
     }
     
     pub fn add(a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
@@ -245,7 +245,7 @@ pub(crate) mod tensor_ops {
             input.clone() 
         };
 
-        let mut output = input_reshaped.matmul_simd(weight)?;
+        let mut output = Tensor::matmul(&input_reshaped, weight)?;
 
         if let Some(b) = bias {
             if b.rank() != 1 || b.shape[0] != dout {
@@ -457,7 +457,7 @@ impl MultiHeadAttention {
                 let q_slice = q_heads.slice_mha(b_idx, h_idx)?; 
                 let k_t_slice = k_t_final.slice_mha_for_kv(b_idx, h_idx, effective_kv_seq_len)?; 
                 
-                let mut scores_s = q_slice.matmul_simd(&k_t_slice)?; 
+                let mut scores_s = Tensor::matmul(&q_slice, &k_t_slice)?; 
                 for val in scores_s.data.iter_mut() {
                     *val /= scale;
                 }
@@ -513,7 +513,7 @@ impl MultiHeadAttention {
             for h_idx in 0..n_head {
                 let probs_slice = att_probs.slice_mha_custom(b_idx, h_idx, current_seq_len, effective_kv_seq_len)?; 
                 let v_slice = v_for_attention_all_heads.slice_mha_for_kv(b_idx, h_idx, effective_kv_seq_len)?; 
-                out_att_parts.push(probs_slice.matmul_simd(&v_slice)?); 
+                out_att_parts.push(Tensor::matmul(&probs_slice, &v_slice)?); 
             }
         }
         let mut out_att_data_flat = Vec::new();
@@ -565,7 +565,7 @@ impl FeedForward {
 
     pub fn forward(&self, x: &Tensor<f32>) -> Result<Tensor<f32>, TransformerError> {
         let mut h = tensor_ops::linear(x, &self.c_fc_w, Some(&self.c_fc_b))?;
-        h = h.gelu_simd()?; 
+        h = h.gelu()?; 
         let output = tensor_ops::linear(&h, &self.c_proj_w, Some(&self.c_proj_b))?;
         Ok(output)
     }
@@ -693,7 +693,7 @@ impl GPT2Model {
         token_ids: &Tensor<u32>, 
         _mask: Option<&Tensor<f32>>, // Original mask, might need to be regenerated or passed carefully
         theta_hat: Option<f32>,
-        model_cache: Option<&mut ModelKVCache>
+        mut model_cache: Option<&mut ModelKVCache>
     ) -> Result<Tensor<f32>, TransformerError> {
         let batch_size = token_ids.shape[0];
         let current_seq_len = token_ids.shape[1]; // S_q
