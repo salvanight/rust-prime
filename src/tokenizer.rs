@@ -1,104 +1,594 @@
-use tokenizers::Tokenizer; // From the 'tokenizers' crate
-use std::path::Path;
+// Renaming import for clarity, though not strictly necessary if TruncationParams and PaddingParams are not used elsewhere.
+// For this file, direct use of tokenizers::TruncationParams and tokenizers::PaddingParams in method signatures is fine.
+use tokenizers::{
+    Tokenizer, 
+    Error as TokenizersLibraryError, 
+    PaddingParams, 
+    TruncationParams, 
+    AddedToken,
+    models::bpe::BPE,
+    pre_tokenizers::byte_level::ByteLevel as ByteLevelPretokenizer,
+    decoders::byte_level::ByteLevel as ByteLevelDecoder,
+    // normalizers::utils::Sequence as NormalizerSequence, // For potential NFC normalizer
+    // normalizers::unicode::NFC,
+};
+use std::path::{Path, PathBuf}; // Added PathBuf for error context
+use std::fmt;
+use std::io; // For std::io::Error
 
-#[derive(Debug)] // Added Debug derive for convenience
+#[cfg(feature = "tokenizer-debug-logs")]
+use log::{debug, trace, warn};
+
+/// Represents errors that can occur within the `TokenizerWrapper`.
+#[derive(Debug)]
+pub enum TokenizerError {
+    /// An I/O error occurred.
+    Io(io::Error),
+    /// An error originating from the underlying `tokenizers` library.
+    /// Contains the string representation of the library error.
+    Library(String),
+    /// Error encountered while attempting to load a tokenizer model from a file.
+    /// This variant can be used if specific context beyond the library error is needed.
+    /// For direct `?` usage with `tokenizers::Error`, `Library` variant will be used.
+    FailedToLoad { path: PathBuf, source_message: String },
+    /// Error encountered during the text encoding process.
+    EncodingFailed { text: String, source_message: String },
+    /// Error encountered during the token ID decoding process.
+    DecodingFailed { ids: Vec<u32>, source_message: String },
+}
+
+/// Options for configuring the encoding process, specifically truncation and padding.
+#[derive(Debug, Clone, Default)]
+pub struct EncodeOptions {
+    /// Optional truncation parameters. If `None`, no truncation is applied beyond tokenizer defaults.
+    pub truncation: Option<TruncationParams>,
+    /// Optional padding parameters. If `None`, no padding is applied.
+    pub padding: Option<PaddingParams>,
+}
+
+impl EncodeOptions {
+    /// Creates new `EncodeOptions` with both truncation and padding set to `None`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl fmt::Display for TokenizerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenizerError::Io(err) => write!(f, "I/O error: {}", err),
+            TokenizerError::Library(msg) => write!(f, "Tokenizer library error: {}", msg),
+            TokenizerError::FailedToLoad{ path, source_message } => write!(f, "Failed to load tokenizer from {:?}: {}", path, source_message),
+            TokenizerError::EncodingFailed{ text, source_message } => write!(f, "Encoding failed for text '{}': {}", text, source_message),
+            TokenizerError::DecodingFailed{ ids, source_message } => write!(f, "Decoding failed for IDs {:?}: {}", ids, source_message),
+        }
+    }
+}
+
+impl std::error::Error for TokenizerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TokenizerError::Io(ref err) => Some(err),
+            // Library error string is stored, so no deeper source.
+            // If TokenizersLibraryError was boxed, it could be returned.
+            TokenizerError::Library(_) => None, 
+            TokenizerError::FailedToLoad { .. } => None, // source_message is String
+            TokenizerError::EncodingFailed { .. } => None, // source_message is String
+            TokenizerError::DecodingFailed { .. } => None, // source_message is String
+        }
+    }
+}
+
+// Implement From<std::io::Error> for TokenizerError
+impl From<io::Error> for TokenizerError {
+    fn from(err: io::Error) -> Self {
+        TokenizerError::Io(err)
+    }
+}
+
+// Implement From<tokenizers::Error> for TokenizerError
+impl From<TokenizersLibraryError> for TokenizerError {
+    fn from(err: TokenizersLibraryError) -> Self {
+        TokenizerError::Library(err.to_string())
+    }
+}
+
+/// A wrapper around the Hugging Face `tokenizers::Tokenizer` to provide a simplified API
+/// for common tokenization tasks such as loading, encoding, decoding, and vocabulary size retrieval.
+///
+/// This struct holds an instance of `tokenizers::Tokenizer` and provides methods
+/// that map to its core functionalities, along with custom error handling
+/// defined by `TokenizerError`. It supports loading pre-configured tokenizers from a single
+/// JSON file (via `new()`) or constructing specific tokenizers like GPT-2 from their
+/// constituent vocabulary and merge files (via `from_gpt2_files()`).
+///
+/// ## Optional Debug Logging
+/// This crate includes optional debug logging via the `log` crate. To enable it, compile
+/// with the `tokenizer-debug-logs` feature:
+///
+/// ```bash
+/// cargo build --features tokenizer-debug-logs
+/// ```
+///
+/// You will also need to use a logger implementation (e.g., `env_logger`, `simple_logger`)
+/// in your application to see the log output.
+#[derive(Debug)]
 pub struct TokenizerWrapper {
     tokenizer: Tokenizer,
 }
 
 impl TokenizerWrapper {
-    pub fn new(tokenizer_path: &Path) -> Result<Self, String> {
+    /// Creates a new `TokenizerWrapper` by loading a tokenizer model from the specified file path.
+    /// This method is suitable for loading tokenizer configurations that are fully defined
+    /// in a single `tokenizer.json` file.
+    ///
+    /// # Parameters
+    /// - `tokenizer_path`: A reference to a `Path` pointing to the tokenizer model file
+    ///   (e.g., a `tokenizer.json` file).
+    ///
+    /// # Returns
+    /// - `Ok(Self)`: A new `TokenizerWrapper` instance if loading the tokenizer model is successful.
+    /// - `Err(TokenizerError::FailedToLoad)`: If the tokenizer model cannot be loaded.
+    ///   The error includes the path and the underlying error message from the library.
+    pub fn new(tokenizer_path: &Path) -> Result<Self, TokenizerError> {
+        #[cfg(feature = "tokenizer-debug-logs")]
+        debug!("Attempting to load tokenizer from path: {:?}", tokenizer_path);
+
         let tokenizer_instance = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| format!("Failed to load tokenizer from {:?}: {}", tokenizer_path, e))?;
+            .map_err(|e| {
+                #[cfg(feature = "tokenizer-debug-logs")]
+                warn!("Failed to load tokenizer from {:?}: {}", tokenizer_path, e);
+                TokenizerError::FailedToLoad {
+                    path: tokenizer_path.to_path_buf(),
+                    source_message: e.to_string(),
+                }
+            })?;
+
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!("Successfully loaded tokenizer from path: {:?}", tokenizer_path);
         Ok(Self { tokenizer: tokenizer_instance })
     }
 
-    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, String> {
-        let encoding = self.tokenizer.encode(text, add_special_tokens)
-            .map_err(|e| format!("Encoding failed for text '{}': {}", text, e))?;
-        Ok(encoding.get_ids().to_vec())
+    /// Creates a new `TokenizerWrapper` specifically configured for a GPT-2 style tokenizer
+    /// from the given vocabulary and merges files.
+    ///
+    /// This method sets up a Byte Pair Encoding (BPE) model using the provided vocabulary
+    /// and merge rules. It configures the tokenizer with components standard for GPT-2:
+    /// - **Model**: BPE model with `<|endoftext|>` as the unknown token.
+    /// - **Pre-tokenizer**: `ByteLevel` pre-tokenizer with `add_prefix_space: false` and `trim_offsets: true`.
+    /// - **Decoder**: `ByteLevel` decoder.
+    ///
+    /// No explicit normalizer (e.g., NFC) or post-processor (e.g., for BOS/EOS tokens like `<|endoftext|>`)
+    /// is added by this method. The `add_special_tokens` flag in the `encode` method might not automatically
+    /// prepend/append BOS/EOS tokens unless the underlying model or a (not-set-here) post-processor handles it.
+    /// For GPT-2, `<|endoftext|>` (ID 50256) often serves as the EOS token and sometimes as a BOS token,
+    /// typically managed by the application or training process by including it in the input sequence.
+    ///
+    /// # Parameters
+    /// - `vocab_path`: Path to the GPT-2 vocabulary JSON file (e.g., `gpt2-vocab.json`).
+    ///   This file maps tokens to their IDs.
+    /// - `merges_path`: Path to the GPT-2 merges text file (e.g., `merges.txt`).
+    ///   This file defines the BPE merge rules.
+    ///
+    /// # Returns
+    /// - `Ok(Self)`: A new `TokenizerWrapper` instance configured for GPT-2.
+    /// - `Err(TokenizerError::FailedToLoad)`: If path conversion to string fails (e.g., invalid UTF-8 in paths)
+    ///   or if the vocab/merges files cannot be read by the BPE builder.
+    /// - `Err(TokenizerError::Library)`: If building the BPE model or configuring the tokenizer components fails
+    ///   for other reasons (e.g., an invalid `unk_token` if it were not part of the vocab).
+    pub fn from_gpt2_files(vocab_path: &Path, merges_path: &Path) -> Result<Self, TokenizerError> {
+        #[cfg(feature = "tokenizer-debug-logs")]
+        debug!(
+            "Attempting to load GPT-2 tokenizer from vocab: {:?}, merges: {:?}",
+            vocab_path, merges_path
+        );
+
+        let vocab_str = vocab_path.to_str().ok_or_else(|| TokenizerError::FailedToLoad {
+            path: vocab_path.to_path_buf(),
+            source_message: "Invalid vocab path (not valid UTF-8)".to_string()
+        })?;
+        let merges_str = merges_path.to_str().ok_or_else(|| TokenizerError::FailedToLoad {
+            path: merges_path.to_path_buf(),
+            source_message: "Invalid merges path (not valid UTF-8)".to_string()
+        })?;
+
+        let bpe_model = BPE::from_files(vocab_str, merges_str)
+            .unk_token("<|endoftext|>") 
+            .build()
+            .map_err(|e| TokenizerError::Library(format!("Failed to build BPE model: {}", e)))?;
+
+        let mut tokenizer = Tokenizer::new(Box::new(bpe_model));
+
+        // GPT-2 uses byte-level pre-tokenization without adding a prefix space by default.
+        // ByteLevelPretokenizer::new(add_prefix_space: bool, trim_offsets: bool (use_regex in some versions))
+        // For GPT-2, add_prefix_space is typically false. trim_offsets is true.
+        let pre_tokenizer = ByteLevelPretokenizer::new(false, true);
+        tokenizer.with_pre_tokenizer(Box::new(pre_tokenizer));
+        
+        tokenizer.with_decoder(Box::new(ByteLevelDecoder::default()));
+
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!(
+            "Successfully configured GPT-2 style tokenizer. Vocab size: {}",
+            tokenizer.get_vocab_size(true)
+        );
+
+        Ok(Self { tokenizer })
     }
 
-    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, String> {
-        self.tokenizer.decode(ids, skip_special_tokens)
-            .map_err(|e| format!("Decoding failed for IDs {:?}: {}", ids, e))
+    /// Creates a new `TokenizerWrapper` by loading a base GPT-2 tokenizer and then
+    /// adding a list of custom symbolic tokens.
+    ///
+    /// This is useful for scenarios where a standard GPT-2 model needs to be augmented
+    /// with specific symbols or control tokens (e.g., `"[USER]"`, `"[ASSISTANT]"`, `"[END_OF_TURN]"`).
+    /// These symbols are added as special, single-word tokens that will not be split by
+    /// the BPE model and will bypass some normalization steps.
+    ///
+    /// The base GPT-2 tokenizer is loaded from default paths:
+    /// - Vocab: `resources/tokenizer_data/gpt2/gpt2-vocab.json`
+    /// - Merges: `resources/tokenizer_data/gpt2/merges.txt`
+    /// (Relative to `CARGO_MANIFEST_DIR`).
+    ///
+    /// After loading the base tokenizer, the provided `symbols_to_add` are registered.
+    /// Their assigned token IDs can be retrieved using methods like `tokenizer.token_to_id(symbol)`.
+    ///
+    /// # Parameters
+    /// - `symbols_to_add`: A slice of string slices, where each string is a new symbolic token
+    ///   to be added to the GPT-2 tokenizer.
+    ///
+    /// # Returns
+    /// - `Ok(Self)`: A new `TokenizerWrapper` instance with the base GPT-2 tokenizer augmented
+    ///   with the specified symbolic tokens.
+    /// - `Err(TokenizerError)`: If loading the base GPT-2 tokenizer fails, or if adding
+    ///   the new symbolic tokens fails. Possible error types include `TokenizerError::FailedToLoad`
+    ///   (if vocab/merges paths are problematic or files are missing/corrupt) or
+    ///   `TokenizerError::Library` (if BPE model building or adding tokens fails).
+    pub fn from_symbolic_gpt2(symbols_to_add: &[&str]) -> Result<Self, TokenizerError> {
+        let base_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let vocab_path = base_dir.join("resources/tokenizer_data/gpt2/gpt2-vocab.json");
+        let merges_path = base_dir.join("resources/tokenizer_data/gpt2/merges.txt");
+
+        #[cfg(feature = "tokenizer-debug-logs")]
+        debug!(
+            "Creating symbolic GPT-2 tokenizer. Base vocab: {:?}, base merges: {:?}, symbols to add: {:?}",
+            vocab_path, merges_path, symbols_to_add
+        );
+
+        if !vocab_path.exists() {
+            return Err(TokenizerError::FailedToLoad { path: vocab_path, source_message: "GPT-2 vocab file not found.".to_string() });
+        }
+        if !merges_path.exists() {
+            return Err(TokenizerError::FailedToLoad { path: merges_path, source_message: "GPT-2 merges file not found.".to_string() });
+        }
+
+        let mut tokenizer_wrapper = Self::from_gpt2_files(&vocab_path, &merges_path)?;
+
+        if !symbols_to_add.is_empty() {
+            let added_tokens: Vec<AddedToken> = symbols_to_add
+                .iter()
+                .map(|s| AddedToken::from(*s, true).special(true)) // `true` for single_word, .special(true) to ensure it's treated as special
+                .collect();
+            
+            #[cfg(feature = "tokenizer-debug-logs")]
+            debug!("Adding symbolic tokens to GPT-2 base: {:?}", added_tokens);
+
+            match tokenizer_wrapper.add_new_tokens(&added_tokens) {
+                Ok(num_added) => {
+                    #[cfg(feature = "tokenizer-debug-logs")]
+                    trace!("Successfully added {} symbolic tokens.", num_added);
+                }
+                Err(e) => {
+                    #[cfg(feature = "tokenizer-debug-logs")]
+                    warn!("Failed to add symbolic tokens: {}", e);
+                    return Err(e); // Propagate the error
+                }
+            }
+        }
+        
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!("Successfully created symbolic GPT-2 tokenizer.");
+        Ok(tokenizer_wrapper)
     }
 
+
+    /// Encodes a given text string into a sequence of token IDs.
+    ///
+    /// # Parameters
+    /// - `text`: The text string to be encoded.
+    /// - `add_special_tokens`: A boolean indicating whether to include special tokens
+    ///   (e.g., `[CLS]`, `[SEP]`) in the encoded output, as defined by the tokenizer model's
+    ///   configuration.
+    ///
+    /// # Returns
+    /// - `Ok(Vec<u32>)`: A vector of `u32` token IDs representing the encoded text.
+    /// - `Err(TokenizerError::EncodingFailed)`: If encoding fails.
+    ///   The error includes the input text and the underlying error message from the library.
+    ///
+    /// # Parameters
+    /// - `text`: The text string to be encoded.
+    /// - `add_special_tokens`: A boolean indicating whether to include special tokens.
+    /// - `options`: An optional `EncodeOptions` struct to specify truncation and padding.
+    ///   If `None`, default encoding behavior (no specific truncation or padding for this call) is used.
+    pub fn encode(&self, text: &str, add_special_tokens: bool, options: Option<EncodeOptions>) -> Result<Vec<u32>, TokenizerError> {
+        #[cfg(feature = "tokenizer-debug-logs")]
+        debug!(
+            "Encoding text: '{}', add_special_tokens: {}, options: {:?}",
+            text, add_special_tokens, options
+        );
+
+        let mut tokenizer_instance = self.tokenizer.clone(); // Clone to apply per-call settings
+
+        let (truncation_params, padding_params) = match options {
+            Some(opts) => (opts.truncation, opts.padding),
+            None => (None, None),
+        };
+
+        #[cfg(feature = "tokenizer-debug-logs")]
+        if let Some(ref params) = truncation_params {
+            trace!("Applying truncation parameters: {:?}", params);
+        }
+        tokenizer_instance.set_truncation(truncation_params)
+            .map_err(|e| TokenizerError::EncodingFailed {
+                text: format!("Failed to set truncation for text '{}'", if text.len() > 50 { &text[..50] } else { text }),
+                source_message: e.to_string(),
+            })?;
+
+        #[cfg(feature = "tokenizer-debug-logs")]
+        if let Some(ref params) = padding_params {
+            trace!("Applying padding parameters: {:?}", params);
+        }
+        tokenizer_instance.set_padding(padding_params)
+            .map_err(|e| TokenizerError::EncodingFailed {
+                text: format!("Failed to set padding for text '{}'", if text.len() > 50 { &text[..50] } else { text }),
+                source_message: e.to_string(),
+            })?;
+
+        let encoding_result = tokenizer_instance.encode(text, add_special_tokens)
+            .map_err(|e| TokenizerError::EncodingFailed {
+                text: text.to_string(), // Full text for this error context
+                source_message: e.to_string(),
+            })?;
+        
+        let encoded_ids = encoding_result.get_ids().to_vec();
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!("Encoded IDs: {:?}", encoded_ids);
+        Ok(encoded_ids)
+    }
+
+    /// Decodes a sequence of token IDs back into a text string.
+    ///
+    /// # Parameters
+    /// - `ids`: A slice of `u32` token IDs to be decoded.
+    /// - `skip_special_tokens`: A boolean indicating whether to remove special tokens
+    ///   (e.g., `[CLS]`, `[SEP]`, `[PAD]`) from the decoded string. This is based on the
+    ///   tokenizer model's definition of special tokens.
+    ///
+    /// # Returns
+    /// - `Ok(String)`: The decoded text string.
+    /// - `Err(TokenizerError::DecodingFailed)`: If decoding fails.
+    ///   The error includes the token IDs and the underlying error message from the library.
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, TokenizerError> {
+        #[cfg(feature = "tokenizer-debug-logs")]
+        debug!(
+            "Decoding IDs: {:?}, skip_special_tokens: {}",
+            ids, skip_special_tokens
+        );
+
+        let decoded_string = self.tokenizer.decode(ids, skip_special_tokens)
+            .map_err(|e| TokenizerError::DecodingFailed {
+                ids: ids.to_vec(),
+                source_message: e.to_string(),
+            })?;
+
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!("Decoded text: '{}'", decoded_string);
+        Ok(decoded_string)
+    }
+
+    /// Retrieves the vocabulary size of the loaded tokenizer.
+    ///
+    /// # Parameters
+    /// - `with_added_tokens`: A boolean that determines whether to include "added tokens"
+    ///   (tokens not part of the core model vocabulary but added for specific purposes,
+    ///   like special control tokens) in the count.
+    ///   - `true`: Includes added tokens in the vocabulary size.
+    ///   - `false`: Returns the size of the base vocabulary, excluding added tokens
+    ///     (unless those tokens are also part of the base vocabulary itself).
+    ///   The exact interpretation may depend on the tokenizer's configuration.
+    ///
+    /// # Returns
+    /// - `u32`: The size of the vocabulary as a `u32` integer.
+    // The duplicated get_vocab_size was an artifact from a previous incorrect merge.
+    // This is the correct single definition.
     pub fn get_vocab_size(&self) -> u32 {
-        self.tokenizer.get_vocab_size(true) as u32 // Cast usize to u32
+        // This method is simple enough that perhaps only a trace log is needed.
+        // The parameter `with_added_tokens` was part of a previous iteration but removed.
+        // The current signature takes no parameters and defaults to `true`.
+        let vocab_size = self.tokenizer.get_vocab_size(true) as u32;
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!(
+            "Getting vocab size (with_added_tokens=true). Returned size: {}",
+            vocab_size
+        );
+        vocab_size
+    }
+
+    /// Adds new tokens to the tokenizer's vocabulary at runtime.
+    ///
+    /// This method allows extending the existing vocabulary with new tokens.
+    /// The added tokens are typically treated as special tokens or whole words,
+    /// depending on their configuration and the underlying tokenizer model.
+    /// For example, to add a token that should be treated as a single unit and not
+    /// be split by the model, you might use `AddedToken::from("new_word", true).single_word(true)`.
+    ///
+    /// Note: This modifies the internal tokenizer instance (`&mut self`).
+    ///
+    /// # Parameters
+    /// - `tokens`: A slice of `AddedToken` structs representing the new tokens to add.
+    ///
+    /// # Returns
+    /// - `Ok(usize)`: The number of tokens effectively added to the vocabulary.
+    /// - `Err(TokenizerError::Library)`: If adding tokens fails (e.g., due to internal tokenizer issues).
+    pub fn add_new_tokens(&mut self, tokens: &[AddedToken]) -> Result<usize, TokenizerError> {
+        #[cfg(feature = "tokenizer-debug-logs")]
+        debug!("Adding new tokens: {:?}", tokens);
+
+        let num_added = self.tokenizer.add_tokens(tokens)
+            .map_err(|e| TokenizerError::Library(format!("Failed to add new tokens: {}", e)))?;
+        
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!("Successfully added {} tokens. New vocab size: {}", num_added, self.tokenizer.get_vocab_size(true));
+        Ok(num_added)
+    }
+
+    /// Retrieves the numerical ID of a given token string (symbol) from the tokenizer's vocabulary.
+    ///
+    /// This method can be used to find the ID for any token known to the tokenizer,
+    /// including standard vocabulary tokens and custom symbols that might have been
+    /// added via methods like `add_new_tokens` or constructors like `from_symbolic_gpt2`.
+    ///
+    /// # Parameters
+    /// - `symbol`: The token string (e.g., "hello", "<|endoftext|>", `"[USER_PROMPT]"`) whose ID is to be retrieved.
+    ///
+    /// # Returns
+    /// - `Some(u32)`: If the token is found in the vocabulary, containing its numerical ID.
+    /// - `None`: If the token is not found in the vocabulary.
+    pub fn get_symbol_id(&self, symbol: &str) -> Option<u32> {
+        let result = self.tokenizer.token_to_id(symbol);
+        #[cfg(feature = "tokenizer-debug-logs")]
+        trace!("Looking up ID for symbol: '{}', Found: {:?}", symbol, result);
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::fs; // Required for cleaning up test file if necessary
+    use std::io::Write; // For NamedTempFile::write_all
+    use tempfile::NamedTempFile;
+    use tokenizers::AddedToken; // Required for add_new_tokens test
 
-    // Helper to get the path to the dummy tokenizer created in the previous step.
-    // Assumes it's in the crate root.
-    fn get_dummy_tokenizer_path() -> PathBuf {
-        PathBuf::from("test_tokenizer.json")
+    // Define the dummy tokenizer JSON content
+    // This structure is based on typical Hugging Face tokenizer files.
+    const DUMMY_TOKENIZER_JSON: &str = r#"
+    {
+      "model": {
+        "type": "BPE",
+        "vocab": {
+          "[PAD]": 0,
+          "[UNK]": 1,
+          "[CLS]": 2,
+          "[SEP]": 3,
+          "[MASK]": 4,
+          "hello": 5,
+          "world": 6,
+          "##d": 7,
+          "Ġ": 8,
+          "Ġhello": 9,
+          "Ġworld": 10,
+          "Ġ##d" : 11
+        },
+        "merges": [
+          "Ġ h",      // For " hello" -> "Ġhello"
+          "Ġ w",      // For " world" -> "Ġworld"
+          "h e",      // For "hello"
+          "l l",
+          "o w",      // Not used by "hello" or "world" directly but good for BPE example
+          "r l",      // For "world"
+          "l d",      // For "world"
+          "Ġ ##",     // For "Ġ##d"
+          "## d"      // For "Ġ##d"
+        ]
+      },
+      "normalizer": {
+        "type": "BertNormalizer",
+        "lowercase": true,
+        "strip_accents": true,
+        "clean_text": true
+      },
+      "pre_tokenizer": {
+        "type": "BertPreTokenizer"
+      },
+      "post_processor": {
+        "type": "BertProcessing",
+        "sep": ["[SEP]", 3],
+        "cls": ["[CLS]", 2]
+      },
+      "decoder": {
+        "type": "BPEDecoder",
+        "suffix": "Ġ" 
+      }
     }
-    
-    // It's good practice to clean up created test files, though NamedTempFile is better for this.
-    // For now, if test_tokenizer.json is part of the repo for testing, manual cleanup is fine.
-    // If it's generated per test run, it should be cleaned up.
-    // Given it was created in a previous step, we'll assume it exists for these tests.
+    "#;
+
+    // This helper function is defined at the `tests` module level to be shared.
+    // It ensures the NamedTempFile lives as long as the TokenizerWrapper instance.
+    fn setup_temp_tokenizer_file_and_wrapper(json_content: &str) -> (NamedTempFile, TokenizerWrapper) {
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temporary file for test");
+        temp_file.write_all(json_content.as_bytes()).expect("Failed to write to temporary test file");
+        temp_file.flush().expect("Failed to flush temporary test file");
+        let wrapper = TokenizerWrapper::new(temp_file.path())
+            .expect("Failed to load TokenizerWrapper from temporary test file");
+        (temp_file, wrapper)
+    }
 
     #[test]
     fn test_tokenizer_new_load_fails_for_nonexistent_file() {
         let non_existent_path = Path::new("non_existent_tokenizer.json");
         let result = TokenizerWrapper::new(non_existent_path);
         assert!(result.is_err());
-        if let Err(e) = result {
-            println!("Load non-existent file error: {}", e); // Print error for debugging
-            assert!(e.contains("Failed to load tokenizer"));
+        match result {
+            Err(TokenizerError::FailedToLoad{ path, source_message }) => {
+                println!("Load non-existent file error (FailedToLoad): Path: {:?}, Source: {}", path, source_message);
+                assert_eq!(path, non_existent_path.to_path_buf());
+                // The source_message from tokenizers::Error for a non-existent file is usually specific.
+                assert!(source_message.contains("No such file or directory") || source_message.contains("failed to read file"));
+            }
+            other_err => panic!("Expected FailedToLoad error variant, got {:?}", other_err),
         }
     }
 
     #[test]
     fn test_tokenizer_new_load_succeeds_and_get_vocab_size() {
-        let dummy_path = get_dummy_tokenizer_path();
-        // Ensure the dummy file exists before running this test.
-        // If it doesn't, this test will fail, which is expected.
-        // The previous step should have created it.
-        if !dummy_path.exists() {
-            panic!("Dummy tokenizer file 'test_tokenizer.json' not found. Create it before running tests.");
-        }
-
-        let wrapper_result = TokenizerWrapper::new(&dummy_path);
-        assert!(wrapper_result.is_ok(), "Failed to load dummy tokenizer: {:?}", wrapper_result.err());
-        let wrapper = wrapper_result.unwrap();
+        let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON); 
+        // No need to assert wrapper_result.is_ok(), as setup_..._and_wrapper panics on failure.
         
-        // The dummy tokenizer has "hello", "world", "##d" + 5 special tokens ([PAD], [UNK], [CLS], [SEP], [MASK])
-        // So, vocab size should be 3 (regular words) + 5 (added special tokens) = 8.
-        // Let's verify the vocab in test_tokenizer.json:
-        // "vocab": { "hello": 5, "world": 6, "##d": 7, "[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "[MASK]": 4 }
-        // The keys are the tokens. The values are their IDs.
-        // The `get_vocab_size(true)` method returns the total size including added tokens.
-        // The highest ID is 7 ("##d"), so IDs are 0-7, meaning size is 8.
-        assert_eq!(wrapper.get_vocab_size(), 8, "Vocab size mismatch for dummy tokenizer.");
+        // Vocab from DUMMY_TOKENIZER_JSON:
+        // "[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "[MASK]": 4,
+        // "hello": 5, "world": 6, "##d": 7, "Ġ": 8,
+        // "Ġhello": 9, "Ġworld": 10, "Ġ##d" : 11
+        // Total 12 tokens in the "model.vocab".
+        // `get_vocab_size()` calls `self.tokenizer.get_vocab_size(true)`, which includes added tokens.
+        // In this JSON, CLS and SEP are also defined in the main vocab and used by post_processor.
+        // So, the vocab size should be the number of entries in "model.vocab".
+        assert_eq!(wrapper.get_vocab_size(), 12, "Vocab size mismatch for dummy tokenizer.");
     }
 
     #[test]
     fn test_tokenizer_encode_decode() {
-        let dummy_path = get_dummy_tokenizer_path();
-        if !dummy_path.exists() {
-            panic!("Dummy tokenizer file 'test_tokenizer.json' not found.");
-        }
-        let wrapper = TokenizerWrapper::new(&dummy_path).expect("Failed to load dummy tokenizer for encode/decode test.");
+        let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
 
         let text_to_encode = "hello world";
-        let encode_result = wrapper.encode(text_to_encode, false); // add_special_tokens = false
-        assert!(encode_result.is_ok(), "Encoding failed: {:?}", encode_result.err());
+        // Pass None for options to keep original test behavior
+        let encode_result = wrapper.encode(text_to_encode, false, None); 
+        assert!(encode_result.is_ok(), "Encoding failed: {:?}", encode_result.err().map(|e| e.to_string()));
         let encoded_ids = encode_result.unwrap();
         
-        // Based on dummy_tokenizer.json: "hello" -> 5, "world" -> 6
-        assert_eq!(encoded_ids, vec![5, 6], "Encoded IDs do not match expected for 'hello world'.");
+        // With DUMMY_TOKENIZER_JSON:
+        // Input: "hello world"
+        // BertNormalizer (lowercase: true): "hello world"
+        // BertPreTokenizer: Splits into words: "hello", "world"
+        // BPE Model:
+        //   "hello" is in vocab -> 5
+        //   For "world", BertPreTokenizer gives "world". The BPE model needs "Ġworld" for ID 10.
+        //   The pre_tokenizer should handle the space: "hello", "Ġworld" if it's not the first word.
+        //   However, `encode` on `Tokenizer` with `BertPreTokenizer` usually handles space prefixing.
+        //   So, "hello" -> 5. "world" (after first word) -> "Ġworld" -> 10.
+        // Expected: [5, 10]
+        assert_eq!(encoded_ids, vec![5, 10], "Encoded IDs do not match expected for 'hello world'.");
 
         let decode_result = wrapper.decode(&encoded_ids, true); // skip_special_tokens = true
-        assert!(decode_result.is_ok(), "Decoding failed: {:?}", decode_result.err());
+        assert!(decode_result.is_ok(), "Decoding failed: {:?}", decode_result.err().map(|e| e.to_string()));
         let decoded_text = decode_result.unwrap();
 
         // The HuggingFace tokenizers library often lowercases by default with BertNormalizer,
@@ -107,12 +597,19 @@ mod tests {
         assert_eq!(decoded_text, "hello world", "Decoded text does not match original (post-normalization).");
 
         // Test with special tokens
-        let text_with_special = "[CLS] hello world [SEP]";
-        let encoded_special_result = wrapper.encode(text_with_special, true); // add_special_tokens = true (though already in text)
-        assert!(encoded_special_result.is_ok());
+        let text_for_special_tokens = "hello world"; // User input part
+        // Pass None for options
+        let encoded_special_result = wrapper.encode(text_for_special_tokens, true, None); 
+        assert!(encoded_special_result.is_ok(), "Encoding special tokens failed: {:?}", encoded_special_result.err().map(|e| e.to_string()));
         let encoded_special_ids = encoded_special_result.unwrap();
-        // Expected: [CLS] -> 2, hello -> 5, world -> 6, [SEP] -> 3
-        assert_eq!(encoded_special_ids, vec![2, 5, 6, 3]);
+
+        // Input: "hello world", add_special_tokens=true
+        // Normalized: "hello world"
+        // Pre-tokenized by BertPreTokenizer: "hello", "world"
+        // BPE encoding of parts: "hello" -> 5, "world" (becomes "Ġworld" due to space) -> 10. Intermediate: [5, 10]
+        // Post-processor (BertProcessing): Adds [CLS] (ID 2) at start, [SEP] (ID 3) at end.
+        // Expected: [2, 5, 10, 3]
+        assert_eq!(encoded_special_ids, vec![2, 5, 10, 3], "Encoded IDs with special tokens do not match.");
 
         // Decode skipping special tokens
         let decoded_skip_special = wrapper.decode(&encoded_special_ids, true).unwrap();
@@ -122,8 +619,857 @@ mod tests {
         let decoded_no_skip_special = wrapper.decode(&encoded_special_ids, false).unwrap();
         assert_eq!(decoded_no_skip_special, "[CLS] hello world [SEP]");
     }
+
+    #[test]
+    fn test_encode_error_handling() {
+        // This test assumes that the underlying tokenizer's encode method can fail
+        // For example, if it encounters an unhandled situation or internal limit.
+        // Since the dummy tokenizer is very simple, it's hard to make it fail reliably
+        // without specific knowledge of `tokenizers::Tokenizer` internals that cause errors
+        // beyond simple string processing.
+        // We'll simulate a failure by trying to encode a ridiculously long string,
+        // though this might just be slow rather than erroring with the default settings.
+        // A more robust test would mock the Tokenizer trait if we were using one, or
+        // create a specific tokenizer file known to cause encoding issues for certain inputs.
+
+        // For now, this test is more of a placeholder for error *type* checking
+        // if an actual encoding error were to occur.
+        let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+        
+        // Let's assume a hypothetical scenario where encoding an empty string after certain ops might fail
+        // (this is not typical for `encode` which usually returns empty for empty).
+        // Or if a specific (malformed from user perspective) sequence of tokens might be problematic.
+        // The current `tokenizers` lib is quite robust.
+        // Instead, we'll check that if an error *were* to occur, its type is correct.
+        // We can't easily make `tokenizer.encode()` fail with the current setup.
+        // So, this test primarily ensures the error propagation *would* work.
+        // No actual error expected here for valid inputs.
+        // Pass None for options
+        let result = wrapper.encode("test", false, None); 
+        if let Err(e) = result {
+            match e {
+                TokenizerError::EncodingFailed{ text: _, source_message: _ } => { /* This is what we'd expect if it failed */ }
+                // If for some reason it was a Library error (e.g. direct ? from another source)
+                TokenizerError::Library(_) => { /* Potentially acceptable if source_message is good */ }
+                _ => panic!("Unexpected error type for encoding failure: {:?}", e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_error_handling() {
+        // Similar to encode, making `decode` fail typically means providing invalid IDs
+        // that are out of bounds of the vocabulary.
+        let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+
+        let invalid_ids = vec![u32::MAX]; // An ID that's almost certainly not in the vocab
+        let result = wrapper.decode(&invalid_ids, false);
+        assert!(result.is_err());
+        match result {
+            Err(TokenizerError::DecodingFailed{ ids, source_message }) => {
+                println!("Decoding failed as expected (DecodingFailed): IDs: {:?}, Source: {}", ids, source_message);
+                assert_eq!(ids, &invalid_ids);
+                // The source_message from tokenizers::Error for invalid ID might be like "TokenId `X` out of vocabulary bounds"
+                assert!(source_message.contains("out of vocabulary bounds") || source_message.contains("invalid id"));
+            }
+            other_err => panic!("Expected DecodingFailed error variant, got {:?}", other_err),
+        }
+    }
     
-    // Optional: Clean up the dummy tokenizer file after all tests in this module if it's not version controlled.
-    // This would require a custom test runner or a teardown mechanism, which is complex.
-    // For now, manual cleanup or versioning the test_tokenizer.json is assumed.
+    // NamedTempFile handles cleanup automatically when it goes out of scope.
+}
+
+
+    // NamedTempFile handles cleanup automatically when it goes out of scope.
+}
+
+// Test `test_investigate_gpt2_tokenizer_loading` is removed as per instructions.
+// Test `test_load_gpt2_from_files` is moved into the new module `gpt2_integration_tests`
+// and renamed to `test_gpt2_load_and_basic_encode_decode`.
+
+#[cfg(test)]
+mod gpt2_integration_tests {
+    use crate::tokenizer::{TokenizerWrapper, TokenizerError, EncodeOptions, AddedToken};
+    use std::path::{Path, PathBuf};
+
+    fn gpt2_vocab_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/tokenizer_data/gpt2/gpt2-vocab.json")
+    }
+
+    fn gpt2_merges_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/tokenizer_data/gpt2/merges.txt")
+    }
+
+    // Helper to load the GPT-2 tokenizer for tests in this module
+    fn load_gpt2_tokenizer_for_test() -> TokenizerWrapper {
+        let vocab_path = gpt2_vocab_path();
+        let merges_path = gpt2_merges_path();
+        assert!(vocab_path.exists(), "GPT-2 vocab file not found at {:?}", vocab_path);
+        assert!(merges_path.exists(), "GPT-2 merges file not found at {:?}", merges_path);
+        TokenizerWrapper::from_gpt2_files(&vocab_path, &merges_path)
+            .expect("Failed to load GPT-2 tokenizer for test")
+    }
+
+    #[test]
+    fn test_gpt2_load_and_basic_encode_decode() {
+        let wrapper = load_gpt2_tokenizer_for_test();
+        
+        let vocab_size = wrapper.get_vocab_size();
+        assert_eq!(vocab_size, 50257, "GPT-2 vocab size mismatch.");
+
+        let text_to_encode = "hello world"; // Note: GPT-2 is case-sensitive.
+        match wrapper.encode(text_to_encode, false, None) {
+            Ok(ids) => {
+                // Standard GPT-2 tokenization: "hello" -> 31373, " world" -> 995
+                assert_eq!(ids, vec![31373, 995], "GPT-2 encoding of 'hello world' mismatch. Got: {:?}", ids);
+                match wrapper.decode(&ids, true) {
+                    Ok(decoded_text) => {
+                        assert_eq!(decoded_text, "hello world", "GPT-2 decoding mismatch.");
+                    }
+                    Err(e) => panic!("[GPT-2 Basic Test] Decoding failed: {}", e),
+                }
+            }
+            Err(e) => panic!("[GPT-2 Basic Test] Encoding failed: {}", e),
+        }
+
+        let text_to_encode_caps = "Hello World";
+         match wrapper.encode(text_to_encode_caps, false, None) {
+            Ok(ids_caps) => {
+                // "Hello" -> 15496, " World" ->  2769 (note: different from lowercase " world")
+                assert_eq!(ids_caps, vec![15496, 2769], "GPT-2 encoding of 'Hello World' mismatch. Got: {:?}", ids_caps);
+                 match wrapper.decode(&ids_caps, true) {
+                    Ok(decoded_text_caps) => {
+                        assert_eq!(decoded_text_caps, "Hello World", "GPT-2 decoding of caps mismatch.");
+                    }
+                    Err(e) => panic!("[GPT-2 Basic Test] Decoding caps failed: {}", e),
+                }
+            }
+            Err(e) => panic!("[GPT-2 Basic Test] Encoding caps failed: {}", e),
+        }
+
+
+        // Test with add_special_tokens=true
+        // For GPT-2, <|endoftext|> (ID 50256) is the EOS token.
+        // Current `from_gpt2_files` does not add a post-processor for BOS/EOS.
+        // So, `add_special_tokens=true` is not expected to add these automatically for GPT-2.
+        let encode_special_res = wrapper.encode(text_to_encode, true, None);
+            match encode_special_res {
+            Ok(ids_special) => {
+                assert_eq!(ids_special, vec![31373, 995], 
+                    "GPT-2 encoding of 'hello world' with add_special_tokens=true should be [31373, 995] for this basic setup. Got: {:?}", ids_special);
+            }
+            Err(e) => panic!("[GPT-2 Basic Test] Encoding with add_special_tokens=true failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_gpt2_encode_decode_sentence() {
+        let wrapper = load_gpt2_tokenizer_for_test();
+        let sentence = "Hello world, how are you?<|endoftext|>"; 
+        // Expected IDs based on standard GPT-2 tokenization:
+        // "Hello" -> 15496
+        // " world" -> 995  (ByteLevel pretokenizer makes " world" -> "Ġworld")
+        // "," -> 11
+        // " how" -> 1268
+        // " are" -> 526
+        // " you" -> 290
+        // "?" -> 30
+        // "<|endoftext|>" -> 50256 (This is a single token in GPT-2 vocab)
+        let expected_ids = vec![15496, 995, 11, 1268, 526, 290, 30, 50256];
+
+        match wrapper.encode(sentence, false, None) { // add_special_tokens=false because EOT is in string
+            Ok(ids) => {
+                assert_eq!(ids, expected_ids, "GPT-2 encoding of sentence mismatch. Got: {:?}", ids);
+                match wrapper.decode(&ids, false) { // skip_special_tokens=false to keep <|endoftext|>
+                    Ok(decoded_text) => {
+                        assert_eq!(decoded_text, sentence, "GPT-2 decoding of sentence mismatch.");
+                    }
+                    Err(e) => panic!("[GPT-2 Sentence Test] Decoding failed: {}", e),
+                }
+            }
+            Err(e) => panic!("[GPT-2 Sentence Test] Encoding failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_gpt2_add_new_tokens() {
+        let mut wrapper = load_gpt2_tokenizer_for_test();
+        let initial_vocab_size = wrapper.get_vocab_size();
+        assert_eq!(initial_vocab_size, 50257, "Initial GPT-2 vocab size incorrect.");
+
+        let new_tokens_to_add = [
+            AddedToken::from("mycustomtokenXYZ", true).single_word(true),
+            AddedToken::from("<|anotherspecialtok|>", true).single_word(true),
+        ];
+
+        let num_added = wrapper.add_new_tokens(&new_tokens_to_add).expect("Failed to add new tokens to GPT-2 tokenizer");
+        assert_eq!(num_added, 2, "Expected 2 tokens to be added to GPT-2 tokenizer.");
+
+        let new_vocab_size = wrapper.get_vocab_size();
+        assert_eq!(new_vocab_size, initial_vocab_size + num_added as u32, "GPT-2 vocabulary size did not update correctly after adding tokens.");
+
+        // Verify encoding of new tokens
+        let id_custom = wrapper.tokenizer.token_to_id("mycustomtokenXYZ").expect("New token 'mycustomtokenXYZ' not found in vocab");
+        let id_special_new = wrapper.tokenizer.token_to_id("<|anotherspecialtok|>").expect("New token '<|anotherspecialtok|>' not found in vocab");
+
+        assert_eq!(id_custom, initial_vocab_size); // First new ID
+        assert_eq!(id_special_new, initial_vocab_size + 1); // Second new ID
+        
+        let encoded_custom = wrapper.encode("mycustomtokenXYZ", false, None).unwrap();
+        assert_eq!(encoded_custom, vec![id_custom], "Encoding new token 'mycustomtokenXYZ' failed.");
+        // For GPT-2, ByteLevel decoder output might differ slightly for entirely new tokens if they don't map to existing byte sequences well.
+        // However, if added as a single word, it should decode back to itself.
+        assert_eq!(wrapper.decode(&encoded_custom, true).unwrap(), "mycustomtokenXYZ");
+
+
+        let encoded_special_new = wrapper.encode("<|anotherspecialtok|>", false, None).unwrap();
+        assert_eq!(encoded_special_new, vec![id_special_new], "Encoding new token '<|anotherspecialtok|>' failed.");
+        assert_eq!(wrapper.decode(&encoded_special_new, true).unwrap(), "<|anotherspecialtok|>");
+        
+        // Test combined: "hello mycustomtokenXYZ <|anotherspecialtok|>"
+        // The ByteLevel pretokenizer will process " mycustomtokenXYZ" as "ĠmycustomtokenXYZ".
+        // Since "mycustomtokenXYZ" was added (without Ġ), and "<|anotherspecialtok|>" was added (without Ġ),
+        // the behavior of ByteLevel BPE for sequences with spaces around these new tokens can be complex.
+        // The `add_tokens` with `single_word=true` makes the *exact* string a single token.
+        // So, " mycustomtokenXYZ" would be tokenized as "Ġ" then "mycustomtokenXYZ" *if* "mycustomtokenXYZ" is known.
+        // Let's test a simpler case where new tokens are not directly preceded by space that becomes "Ġ".
+        let text_simple_mixed = "mycustomtokenXYZ<|anotherspecialtok|>"; // No space, direct concatenation
+        let encoded_simple_mixed = wrapper.encode(text_simple_mixed, false, None).unwrap();
+        assert_eq!(encoded_simple_mixed, vec![id_custom, id_special_new], "Encoding simple mixed new tokens failed.");
+    }
+
+    #[test]
+    fn test_get_symbol_id() {
+        let mut wrapper = load_gpt2_tokenizer_for_test();
+
+        // Test known tokens from GPT-2 vocab
+        assert_eq!(wrapper.get_symbol_id("hello"), Some(31373), "ID for 'hello' mismatch.");
+        assert_eq!(wrapper.get_symbol_id("<|endoftext|>"), Some(50256), "ID for '<|endoftext|>' mismatch.");
+        
+        // Test a token that includes a space prefix (handled by ByteLevel BPE)
+        // The token " world" (with a leading space) is ID 995.
+        // `get_symbol_id` looks for the exact string in the vocab. The vocab contains "Ġworld".
+        // The ByteLevel pretokenizer converts " world" to "Ġworld" before BPE lookup.
+        // So, to get ID 995, we should lookup "Ġworld".
+        assert_eq!(wrapper.get_symbol_id("Ġworld"), Some(995), "ID for 'Ġworld' mismatch.");
+
+        // Test non-existent token
+        assert_eq!(wrapper.get_symbol_id("nonexistenttoken123"), None, "ID for non-existent token should be None.");
+
+        // Test after adding a new token
+        let initial_vocab_size = wrapper.get_vocab_size(); // 50257
+        let new_symbol = "[USER_PROMPT]";
+        let added_tokens = [AddedToken::from(new_symbol, true).special(true)];
+        wrapper.add_new_tokens(&added_tokens).expect("Failed to add new symbolic token");
+        
+        assert_eq!(wrapper.get_vocab_size(), initial_vocab_size + 1, "Vocab size should increment after adding token.");
+        assert_eq!(wrapper.get_symbol_id(new_symbol), Some(initial_vocab_size), "ID for newly added symbolic token is incorrect.");
+
+        // Test another non-existent token after adding one
+        assert_eq!(wrapper.get_symbol_id("anothernonexistent"), None, "ID for another non-existent token should be None after add.");
+    }
+
+    #[test]
+    fn test_from_symbolic_gpt2_basic_workflow() {
+        let symbols = ["<SYMBOL_A>", "<SYMBOL_B>"];
+        let mut wrapper = TokenizerWrapper::from_symbolic_gpt2(&symbols)
+            .expect("Failed to load symbolic GPT-2 tokenizer.");
+
+        let base_vocab_size = 50257; // Standard GPT-2
+        assert_eq!(wrapper.get_vocab_size(), base_vocab_size + 2, "Vocab size mismatch after adding symbols.");
+
+        let id_a = wrapper.get_symbol_id("<SYMBOL_A>");
+        let id_b = wrapper.get_symbol_id("<SYMBOL_B>");
+        assert!(id_a.is_some(), "Symbol A not found.");
+        assert!(id_b.is_some(), "Symbol B not found.");
+        assert_eq!(id_a, Some(base_vocab_size), "ID for SYMBOL_A is incorrect.");
+        assert_eq!(id_b, Some(base_vocab_size + 1), "ID for SYMBOL_B is incorrect.");
+
+        let text = "This uses <SYMBOL_A> and also <SYMBOL_B>.";
+        // "This" -> 1212
+        // " uses" -> 1243
+        // " <SYMBOL_A>" -> Ġ<SYMBOL_A> (ByteLevel will make this "Ġ" + "<SYMBOL_A>")
+        // Since <SYMBOL_A> is added as special, it should be tokenized as itself.
+        // The space before it will be "Ġ".
+        // " and" -> 290 (conflicts with " you", let's check. " and" is 290, " you" is 345) -> " and" is 290.
+        // " also" -> 1004
+        // " <SYMBOL_B>" -> "Ġ" + "<SYMBOL_B>"
+        // "." -> 13
+
+        // Corrected encoding based on how ByteLevel and added special tokens work:
+        // "This" -> 1212
+        // " uses" -> 1243
+        // " " -> "Ġ" (GPT-2 ID for Ġ is 198, if it's not merged. Or handled by ByteLevel)
+        // "<SYMBOL_A>" -> id_a.unwrap()
+        // " and" -> 290
+        // " also" -> 1004
+        // " " -> "Ġ"
+        // "<SYMBOL_B>" -> id_b.unwrap()
+        // "." -> 13
+        
+        // Let's verify parts:
+        // "This uses " -> [1212, 1243, 220] (220 is space " ")
+        // " and also " -> [290, 1004, 220]
+        // "." -> [13]
+
+        let ids_this_uses = wrapper.encode("This uses ", false, None).unwrap();
+        let ids_and_also = wrapper.encode(" and also ", false, None).unwrap();
+        let ids_period = wrapper.encode(".", false, None).unwrap();
+
+        let mut expected_ids: Vec<u32> = Vec::new();
+        expected_ids.extend(ids_this_uses);
+        expected_ids.push(id_a.unwrap());
+        expected_ids.extend(ids_and_also);
+        expected_ids.push(id_b.unwrap());
+        expected_ids.extend(ids_period);
+        
+        let encoded_result = wrapper.encode(text, false, None);
+        assert!(encoded_result.is_ok(), "Encoding with symbolic tokens failed: {:?}", encoded_result.err());
+        let encoded_ids = encoded_result.unwrap();
+        assert_eq!(encoded_ids, expected_ids, "Encoded IDs for symbolic sentence mismatch.");
+
+        let decoded_text = wrapper.decode(&encoded_ids, false).expect("Decoding symbolic sentence failed");
+        assert_eq!(decoded_text, text, "Decoded symbolic sentence does not match original.");
+    }
+
+    #[test]
+    fn test_from_symbolic_gpt2_empty_symbols_list() {
+        let wrapper = TokenizerWrapper::from_symbolic_gpt2(&[])
+            .expect("Failed to load symbolic GPT-2 with empty symbols list.");
+        
+        assert_eq!(wrapper.get_vocab_size(), 50257, "Vocab size should be standard GPT-2 for empty symbols.");
+
+        let text = "hello world";
+        let encoded_ids = wrapper.encode(text, false, None).unwrap();
+        assert_eq!(encoded_ids, vec![31373, 995], "Encoding with base GPT-2 (from symbolic empty) failed.");
+    }
+
+    #[test]
+    fn test_from_symbolic_gpt2_symbol_overlap_handling() {
+        // "<|endoftext|>" is a real GPT-2 token (ID 50256)
+        // "world" is part of "Ġworld" (ID 995)
+        let symbols = ["world", "new_hello_world", "<|endoftext|>custom"];
+        let mut wrapper = TokenizerWrapper::from_symbolic_gpt2(&symbols)
+            .expect("Failed to load symbolic GPT-2 for overlap test.");
+
+        let base_vocab_size = 50257;
+        assert_eq!(wrapper.get_vocab_size(), base_vocab_size + 3);
+
+        let id_world_new = wrapper.get_symbol_id("world").expect("New 'world' symbol not found");
+        let id_new_hello_world = wrapper.get_symbol_id("new_hello_world").expect("Symbol 'new_hello_world' not found");
+        let id_eot_custom = wrapper.get_symbol_id("<|endoftext|>custom").expect("Symbol '<|endoftext|>custom' not found");
+
+        assert_eq!(id_world_new, base_vocab_size);
+        assert_eq!(id_new_hello_world, base_vocab_size + 1);
+        assert_eq!(id_eot_custom, base_vocab_size + 2);
+
+        // Test that the new "world" token is distinct from how GPT-2 might tokenize "world" or " world"
+        // " world" (GPT-2 token) -> [995] ("Ġworld")
+        // "world" (new symbol) -> [id_world_new]
+        let encoded_gpt2_world = wrapper.encode(" world", false, None).unwrap(); // Should use original Ġworld
+        assert_eq!(encoded_gpt2_world, vec![995]);
+
+        let encoded_new_world = wrapper.encode("world", false, None).unwrap(); // Should use new symbol
+        assert_eq!(encoded_new_world, vec![id_world_new]);
+        
+        let text = "A new world and new_hello_world with <|endoftext|>custom.";
+        // "A" -> 32
+        // " new" -> 534
+        // " " -> 220 (space)
+        // "world" (new symbol) -> id_world_new
+        // " and" -> 290
+        // " " -> 220
+        // "new_hello_world" (new symbol) -> id_new_hello_world
+        // " with" -> 750
+        // " " -> 220
+        // "<|endoftext|>custom" (new symbol) -> id_eot_custom
+        // "." -> 13
+
+        let ids_A_new_space = wrapper.encode("A new ", false, None).unwrap(); // [32, 534, 220]
+        let ids_and_space = wrapper.encode(" and ", false, None).unwrap();   // [290, 220]
+        let ids_with_space = wrapper.encode(" with ", false, None).unwrap(); // [750, 220]
+        let ids_period = wrapper.encode(".", false, None).unwrap();         // [13]
+
+        let mut expected_ids: Vec<u32> = Vec::new();
+        expected_ids.extend(ids_A_new_space);
+        expected_ids.push(id_world_new);
+        expected_ids.extend(ids_and_space);
+        expected_ids.push(id_new_hello_world);
+        expected_ids.extend(ids_with_space);
+        expected_ids.push(id_eot_custom);
+        expected_ids.extend(ids_period);
+        
+        let encoded_result = wrapper.encode(text, false, None).unwrap();
+        assert_eq!(encoded_result, expected_ids, "Encoding overlap sentence failed.");
+
+        let decoded_text = wrapper.decode(&encoded_result, false).unwrap();
+        assert_eq!(decoded_text, text, "Decoding overlap sentence failed.");
+    }
+}
+
+
+#[cfg(test)]
+mod proptests {
+    use crate::tokenizer::{TokenizerWrapper, EncodeOptions, TokenizerError, TruncationParams, PaddingParams};
+    use super::{setup_temp_tokenizer_file_and_wrapper, DUMMY_TOKENIZER_JSON}; 
+    use proptest::prelude::*;
+
+    // Strategy for pt_encode_decode_invariant:
+    // Generates strings that are more likely to be handled well by the dummy tokenizer.
+    // Focuses on known vocabulary words and simple combinations.
+    fn reversible_string_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("hello").boxed(),
+            Just("world").boxed(),
+            Just("hello world").boxed(),
+            Just("Ġhello").boxed(), 
+            Just("Ġworld").boxed(),
+            // Limited character set to increase chances of being in vocab
+            prop::collection::vec("[helowrdg# ]{1,10}", 1..5).prop_map(|parts| {
+                let mut s = parts.join(" ");
+                // Ensure some non-whitespace content if parts were all spaces
+                if s.trim().is_empty() && !s.is_empty() { "hello".to_string() } else { s.trim().to_string() }
+            }),
+        ].no_shrink()
+    }
+
+    proptest! {
+        #[test]
+        fn pt_encode_decode_invariant(ref s in reversible_string_strategy()) {
+            let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+
+            let add_special_tokens = false;
+            let options = None;
+
+            prop_assume!(!s.is_empty() && !s.trim().is_empty(), "Skipping empty or whitespace-only string for this invariant test.");
+
+            match wrapper.encode(s, add_special_tokens, options.clone()) {
+                Ok(encoded_ids) => {
+                    prop_assume!(!(encoded_ids.iter().all(|&id| id == 1) && s != "[UNK]"), "Input string '{}' encoded entirely to UNK tokens, skipping strict assertion.", s);
+                    prop_assume!(!encoded_ids.is_empty(), "Input string '{}' encoded to empty IDs, skipping.",s);
+
+                    match wrapper.decode(&encoded_ids, true) { // skip_special_tokens = true
+                        Ok(decoded_text) => {
+                            let mut normalized_s = s.to_lowercase();
+                            normalized_s = normalized_s.split_whitespace().collect::<Vec<&str>>().join(" ");
+
+                            let mut expected_decoded_text = normalized_s.clone();
+                            if s.starts_with("Ġ") && s.len() > 1 && !s.chars().nth(1).unwrap().is_whitespace() {
+                                 expected_decoded_text = s.chars().skip(1).collect::<String>().to_lowercase();
+                                 expected_decoded_text = expected_decoded_text.split_whitespace().collect::<Vec<&str>>().join(" ");
+                            }
+                            
+                            prop_assert_eq!(decoded_text, expected_decoded_text,
+                                "Decoded text did not match expected. Input: '{}', Expected: '{}', Actual Decoded: '{}', Encoded: {:?}", 
+                                s, expected_decoded_text, decoded_text, encoded_ids);
+                        }
+                        Err(e) => {
+                            prop_assert!(false, "Decoding failed: {} for input '{}', encoded_ids {:?}", e, s, encoded_ids);
+                        }
+                    }
+                }
+                Err(e) => {
+                    prop_assert!(false, "Encoding failed for supposedly reversible string: {} for input '{}'", e, s);
+                }
+            }
+        }
+
+        #[test]
+        fn pt_encode_determinism(ref s in ".*\\PC*") { 
+            let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+            
+            let options = None; 
+
+            let res1 = wrapper.encode(s, false, options.clone());
+            let res2 = wrapper.encode(s, false, options.clone());
+
+            match (res1, res2) {
+                (Ok(ids1), Ok(ids2)) => prop_assert_eq!(ids1, ids2, "Encoding was not deterministic for input '{}'", s),
+                (Err(e1), Err(e2)) => {
+                     prop_assert_eq!(e1.to_string(), e2.to_string(), "Error messages were not deterministic for input '{}'. e1: {}, e2: {}", s, e1, e2);
+                },
+                (Ok(ids), Err(e)) => prop_assert!(false, "Encoding mismatch: first Ok({:?}), second Err({}), input '{}'", ids, e, s),
+                (Err(e), Ok(ids)) => prop_assert!(false, "Encoding mismatch: first Err({}), second Ok({:?}), input '{}'", e, ids, s),
+            }
+        }
+
+        #[test]
+        fn pt_encode_crash_test(ref s in ".*\\PC*") {
+            let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+            
+            let _ = wrapper.encode(s, false, None); 
+            let _ = wrapper.encode(s, true, None);  
+            
+            let trunc_params = TruncationParams { max_length: 10, ..Default::default() };
+            let pad_params = PaddingParams { strategy: tokenizers::PaddingStrategy::Fixed(15), pad_id: 0, pad_token: "[PAD]".to_string(), ..Default::default() };
+            let some_options = Some(EncodeOptions {
+                truncation: Some(trunc_params),
+                padding: Some(pad_params),
+            });
+            let _ = wrapper.encode(s, true, some_options); 
+        }
+
+        #[test]
+        fn pt_decode_crash_test(ids in proptest::collection::vec(0u32..20, 0..100)) { // Vocab size is 12, test up to 19 for some invalid IDs.
+            let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+
+            let _ = wrapper.decode(&ids, false); 
+            let _ = wrapper.decode(&ids, true);  
+        }
+    }
+}
+
+
+#[test]
+fn test_encode_empty_string() {
+    let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+
+    let expected_ids: Vec<u32> = Vec::new();
+
+    // Test with add_special_tokens: false
+    let result_no_special = wrapper.encode("", false, None);
+    assert!(result_no_special.is_ok(), "Encoding empty string (no special tokens) failed: {:?}", result_no_special.err());
+    assert_eq!(result_no_special.unwrap(), expected_ids, "Encoding empty string (no special tokens) should produce empty vec.");
+
+    // Test with add_special_tokens: true
+    // BertProcessing post-processor might add [CLS] and [SEP] even for empty input.
+    // Expected: [CLS, SEP] -> [2, 3]
+    let result_special = wrapper.encode("", true, None);
+    assert!(result_special.is_ok(), "Encoding empty string (with special tokens) failed: {:?}", result_special.err());
+    assert_eq!(result_special.unwrap(), vec![2,3], "Encoding empty string (with special tokens) should produce [CLS, SEP].");
+}
+
+#[test]
+fn test_encode_invalid_utf8() {
+    let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+
+    // Create a string containing the Unicode replacement character U+FFFD
+    // This happens when from_utf8_lossy encounters invalid UTF-8 bytes.
+    let invalid_bytes = &[0xC3, 0x28]; // Invalid: C3 without a following continuation byte for a 2-byte sequence
+    let lossy_str = String::from_utf8_lossy(invalid_bytes); // Will contain �
+    assert!(lossy_str.contains('\u{FFFD}'));
+
+    // Expected behavior: The replacement character �, if not in vocab, maps to [UNK] (ID 1)
+    // DUMMY_TOKENIZER_JSON maps "[UNK]" to 1.
+    // The normalizer (BertNormalizer) might clean or handle this.
+    // If '�' itself becomes a token, it might be UNK.
+    let result = wrapper.encode(&lossy_str, false, None);
+    assert!(result.is_ok(), "Encoding invalid UTF-8 (lossy) failed: {:?}", result.err());
+    let encoded_ids = result.unwrap();
+    // Depending on how BertNormalizer and BPE model handle '�':
+    // 1. If '�' is treated as an unknown character, it should become [UNK] -> [1]
+    // 2. If normalizer removes it, it could be empty.
+    // Based on typical behavior, it should map to [UNK].
+    assert_eq!(encoded_ids, vec![1], "Encoding lossy UTF-8 string should produce [UNK].");
+
+    // Test with a more complex case
+    let text_with_invalid = format!("hello {}", String::from_utf8_lossy(&[0xF0, 0x90, 0x80])); // Incomplete 4-byte sequence
+    let result_complex = wrapper.encode(&text_with_invalid, false, None);
+    assert!(result_complex.is_ok(), "Encoding complex invalid UTF-8 failed: {:?}", result_complex.err());
+    // Expected: "hello �" -> "hello", "�" (pre-tokenized)
+    // "hello" -> 5
+    // "�" (as "Ġ�" because it's not first) -> UNK (1) if "Ġ�" not in vocab.
+    // "Ġ" is 8. If � is UNK (1), then "Ġ�" could be [8,1] or just UNK [1].
+    // It's more likely that "�" is tokenized as [UNK] (1).
+    // So, "hello �" -> [5, 1]
+    assert_eq!(result_complex.unwrap(), vec![5, 1], "Encoding 'hello �' should be [hello, UNK].");
+}
+
+
+#[test]
+fn test_tokenizer_encode_truncation() {
+    let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+
+    let text = "hello world and some more words for testing truncation";
+    // Based on DUMMY_TOKENIZER_JSON: "hello"->5, "Ġworld"->10, "Ġand"->UNK(1), "Ġsome"->UNK(1), "Ġmore"->UNK(1) ...
+    // For simplicity, let's use a text that maps to known tokens mostly.
+    // "hello world hello world" -> [5, 10, 9, 10] (Ġhello is 9)
+    let text_long = "hello world hello world"; 
+    let original_ids = wrapper.encode(text_long, false, None).unwrap();
+    assert!(original_ids.len() > 3, "Original encoding is too short to test truncation meaningfully: {:?}", original_ids);
+
+    let truncation_params = TruncationParams {
+        max_length: 3,
+        strategy: tokenizers::TruncationStrategy::LongestFirst, // Default, but explicit
+        stride: 0, // Default
+    };
+    let options = Some(EncodeOptions {
+        truncation: Some(truncation_params.clone()),
+        padding: None,
+    });
+    let truncated_ids_res = wrapper.encode(text_long, false, options);
+    assert!(truncated_ids_res.is_ok(), "Encoding with truncation failed: {:?}", truncated_ids_res.err());
+    let truncated_ids = truncated_ids_res.unwrap();
+    assert_eq!(truncated_ids.len(), 3, "Truncation did not limit to max_length.");
+    assert_eq!(truncated_ids, vec![original_ids[0], original_ids[1], original_ids[2]], "Truncated IDs don't match start of original.");
+
+
+    // Test with add_special_tokens = true.
+    // "hello world" (text_for_special_tokens from previous test) -> [2, 5, 10, 3] (CLS, hello, Ġworld, SEP)
+    // Truncate to max_length 3: Should be [2, 5, 3] (CLS, hello, SEP)
+    let text_short_for_special = "hello"; // Encodes to [5] without special tokens. With special: [2,5,3]
+    let options_special_trunc = Some(EncodeOptions {
+        truncation: Some(truncation_params.clone()),
+        padding: None,
+    });
+    let truncated_special_ids_res = wrapper.encode(text_short_for_special, true, options_special_trunc);
+    assert!(truncated_special_ids_res.is_ok(), "Encoding with truncation and special tokens failed: {:?}", truncated_special_ids_res.err());
+    let truncated_special_ids = truncated_special_ids_res.unwrap();
+    assert_eq!(truncated_special_ids.len(), 3, "Truncation with special tokens did not limit to max_length correctly.");
+    assert_eq!(truncated_special_ids, vec![2, 5, 3], "Truncated IDs with special tokens do not match expected ([CLS], hello, [SEP]).");
+}
+
+#[test]
+fn test_tokenizer_encode_padding() {
+    let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+    // [PAD] token ID is 0 in DUMMY_TOKENIZER_JSON
+
+    let text = "hello"; // Encodes to [5] without special tokens
+    let original_ids = wrapper.encode(text, false, None).unwrap();
+    assert_eq!(original_ids.len(), 1);
+
+    let padding_params_fixed = PaddingParams {
+        strategy: tokenizers::PaddingStrategy::Fixed(5), // Pad to length 5
+        direction: tokenizers::PaddingDirection::Right,  // Default
+        pad_to_multiple_of: None,
+        pad_id: 0, // From DUMMY_TOKENIZER_JSON
+        pad_type_id: 0, // Default
+        pad_token: "[PAD]".to_string(), // From DUMMY_TOKENIZER_JSON
+    };
+    let options_padding = Some(EncodeOptions {
+        truncation: None,
+        padding: Some(padding_params_fixed.clone()),
+    });
+
+    let padded_ids_res = wrapper.encode(text, false, options_padding.clone());
+    assert!(padded_ids_res.is_ok(), "Encoding with padding failed: {:?}", padded_ids_res.err());
+    let padded_ids = padded_ids_res.unwrap();
+    assert_eq!(padded_ids.len(), 5, "Padding did not extend to specified length.");
+    assert_eq!(padded_ids, vec![5, 0, 0, 0, 0], "Padded IDs do not match expected content.");
+
+    // Test padding with special tokens
+    // "hello" (text) -> [5]. With special tokens: [CLS], hello, [SEP] -> [2, 5, 3]. Length 3.
+    // Pad to 5: [2, 5, 3, 0, 0]
+    let padded_special_ids_res = wrapper.encode(text, true, options_padding.clone());
+    assert!(padded_special_ids_res.is_ok(), "Encoding with padding and special tokens failed: {:?}", padded_special_ids_res.err());
+    let padded_special_ids = padded_special_ids_res.unwrap();
+    assert_eq!(padded_special_ids.len(), 5, "Padding with special tokens did not extend to specified length.");
+    assert_eq!(padded_special_ids, vec![2, 5, 3, 0, 0], "Padded IDs with special tokens do not match expected content.");
+
+    // Test padding to a length shorter than the input (should not change input if tokenizer's padding strategy is Fixed)
+    let short_padding_params = PaddingParams {
+        strategy: tokenizers::PaddingStrategy::Fixed(1), // Try to pad to 1
+        ..padding_params_fixed.clone() 
+    };
+    let options_short_padding = Some(EncodeOptions {
+        truncation: None,
+        padding: Some(short_padding_params),
+    });
+    let no_padding_needed_ids = wrapper.encode(text, false, options_short_padding).unwrap();
+    assert_eq!(no_padding_needed_ids, vec![5], "Padding shorter than input changed the input, or padding strategy does not prevent it.");
+}
+
+#[test]
+fn test_encode_extreme_truncation() {
+    let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+    let text = "hello"; // Encodes to [5] without special tokens, [2,5,3] with.
+
+    // Max_length: 0
+    let trunc_to_0 = TruncationParams { max_length: 0, strategy: tokenizers::TruncationStrategy::LongestFirst, stride: 0 };
+    let opts_trunc_0 = Some(EncodeOptions { truncation: Some(trunc_to_0.clone()), padding: None });
+    
+    let res_0_no_special = wrapper.encode(text, false, opts_trunc_0.clone()).unwrap();
+    assert_eq!(res_0_no_special, Vec::<u32>::new(), "Truncation to 0 (no special) should be empty.");
+
+    // With add_special_tokens=true, max_length=0.
+    // The BertProcessing post-processor adds [CLS] and [SEP]. Truncation to 0 might still allow these.
+    // Typically, tokenizers will output at least special tokens if added, even if max_length is very small.
+    // For max_length=0, it usually means only special tokens if they are added, resulting in e.g. [CLS, SEP].
+    let res_0_special = wrapper.encode(text, true, opts_trunc_0.clone()).unwrap();
+    assert_eq!(res_0_special, vec![2,3], "Truncation to 0 (with special) should be [CLS, SEP].");
+
+    // Max_length: 1
+    let trunc_to_1 = TruncationParams { max_length: 1, strategy: tokenizers::TruncationStrategy::LongestFirst, stride: 0 };
+    let opts_trunc_1 = Some(EncodeOptions { truncation: Some(trunc_to_1.clone()), padding: None });
+
+    let res_1_no_special = wrapper.encode(text, false, opts_trunc_1.clone()).unwrap();
+    assert_eq!(res_1_no_special, vec![5], "Truncation to 1 (no special) for 'hello' should be [5].");
+    
+    // With add_special_tokens=true, max_length=1.
+    // Sequence "hello" -> [5]. With special tokens -> [CLS, hello, SEP] -> [2,5,3].
+    // Truncated to 1, it should take the first token, which is [CLS] (ID 2).
+    let res_1_special = wrapper.encode(text, true, opts_trunc_1.clone()).unwrap();
+    assert_eq!(res_1_special, vec![2], "Truncation to 1 (with special) for 'hello' should be [CLS].");
+}
+
+#[test]
+fn test_encode_extreme_padding() {
+    let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+    let text = "hello"; // Encodes to [5] (length 1)
+
+    let padding_params = |len: usize| PaddingParams {
+        strategy: tokenizers::PaddingStrategy::Fixed(len),
+        direction: tokenizers::PaddingDirection::Right,
+        pad_id: 0, // [PAD]
+        pad_token: "[PAD]".to_string(),
+        pad_to_multiple_of: None,
+        pad_type_id: 0,
+    };
+
+    // Pad to length 0
+    let opts_pad_0 = Some(EncodeOptions { padding: Some(padding_params(0)), truncation: None });
+    let res_pad_0 = wrapper.encode(text, false, opts_pad_0).unwrap();
+    assert_eq!(res_pad_0, vec![5], "Padding to 0 should not change 'hello'.");
+
+    // Pad to length 1 (same as original length)
+    let opts_pad_1 = Some(EncodeOptions { padding: Some(padding_params(1)), truncation: None });
+    let res_pad_1 = wrapper.encode(text, false, opts_pad_1).unwrap();
+    assert_eq!(res_pad_1, vec![5], "Padding to 1 should not change 'hello'.");
+
+    // Pad to length 1 (with special tokens)
+    // "hello" with special tokens is [2,5,3] (length 3)
+    // Padding to 1 should not change it.
+    let opts_pad_1_special = Some(EncodeOptions { padding: Some(padding_params(1)), truncation: None });
+    let res_pad_1_special = wrapper.encode(text, true, opts_pad_1_special).unwrap();
+    assert_eq!(res_pad_1_special, vec![2,5,3], "Padding to 1 (special) should not change '[CLS] hello [SEP]'.");
+}
+
+#[test]
+fn test_decode_multiple_invalid_ids() {
+    let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+    
+    let invalid_ids = vec![5, u32::MAX, 6, u32::MAX -1]; // hello, UNK_CONCEPTUAL, world, UNK_CONCEPTUAL
+    let result = wrapper.decode(&invalid_ids, false);
+    assert!(result.is_err(), "Decoding sequence with multiple invalid IDs should fail.");
+    
+    match result {
+        Err(TokenizerError::DecodingFailed{ ids, source_message }) => {
+            assert_eq!(ids, invalid_ids, "Error should contain the original invalid IDs.");
+            assert!(source_message.contains("out of vocabulary bounds") || source_message.contains("invalid id"),
+                    "Error message should indicate an out-of-vocabulary or invalid ID issue.");
+        }
+        other_err => panic!("Expected DecodingFailed error variant, got {:?}", other_err),
+    }
+}
+
+#[test]
+fn test_encode_only_special_tokens() {
+    let (_temp_file, wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+
+    // Test case 1: "[CLS] [SEP]"
+}
+
+
+#[test]
+fn test_add_new_tokens() {
+    let (_temp_file, mut wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+    let initial_vocab_size = wrapper.get_vocab_size(); // is 12 for DUMMY_TOKENIZER_JSON
+
+    let new_tokens = [
+        AddedToken::from("[NEW_TOKEN_1]", true), // true for single_word
+        AddedToken::from("customword", true).single_word(true), // another way for single_word
+        AddedToken::from("anothercustom", false), // not single_word, might be split by BPE
+    ];
+
+    let num_added = wrapper.add_new_tokens(&new_tokens).expect("Failed to add new tokens");
+    assert_eq!(num_added, 3, "Expected 3 tokens to be added."); // Assuming all are new and successfully added
+
+    let new_vocab_size = wrapper.get_vocab_size();
+    assert_eq!(new_vocab_size, initial_vocab_size + num_added as u32, "Vocabulary size did not update correctly.");
+
+    // Test encoding with the new tokens
+    let text1 = "[NEW_TOKEN_1]";
+    let encoded1 = wrapper.encode(text1, false, None).unwrap();
+    let new_token_1_id = initial_vocab_size; // First new ID
+    assert_eq!(encoded1, vec![new_token_1_id], "Encoding '[NEW_TOKEN_1]' failed.");
+    let decoded1 = wrapper.decode(&encoded1, true).unwrap();
+    assert_eq!(decoded1, "[NEW_TOKEN_1]".to_lowercase(), "Decoding '[NEW_TOKEN_1]' failed."); // Normalizer lowercases
+
+    let text2 = "customword";
+    let encoded2 = wrapper.encode(text2, false, None).unwrap();
+    let customword_id = initial_vocab_size + 1; // Second new ID
+    assert_eq!(encoded2, vec![customword_id], "Encoding 'customword' as single token failed.");
+    let decoded2 = wrapper.decode(&encoded2, true).unwrap();
+    assert_eq!(decoded2, "customword", "Decoding 'customword' failed.");
+
+    // Test 'anothercustom' - this one was added with single_word=false (default)
+    // It might be tokenized into subwords if its parts exist in the vocab or BPE can form it.
+    // Or it might become UNK if it's entirely unknown and not a special format.
+    // Given "anothercustom", and vocab like "hello", "world", "##d", "Ġ",
+    // it is likely to be tokenized into multiple UNK tokens or subwords if any part matches.
+    // For simplicity, let's assume it becomes a single new token if the tokenizer simply adds it
+    // without further BPE processing for non-special new tokens.
+    // However, the `tokenizers` library, when adding tokens that are not special and single_word=false,
+    // might still break them down if they are not found in the vocab.
+    // If it's added to vocab, it should get an ID.
+    // Let's verify if it gets its ID.
+    let text3 = "anothercustom";
+    let encoded3 = wrapper.encode(text3, false, None).unwrap();
+    let anothercustom_id = initial_vocab_size + 2; // Third new ID
+    // This assertion depends on how the BPE model handles new non-single-word tokens.
+    // If it's added to vocab and directly matched, it will be its ID.
+    // If it's broken down (e.g. "another" "custom") and those parts map to UNK, it'll be multiple UNKs.
+    // The `add_tokens` method usually makes the exact string learnable.
+    assert_eq!(encoded3, vec![anothercustom_id], "Encoding 'anothercustom' failed. It might have been tokenized differently.");
+    let decoded3 = wrapper.decode(&encoded3, true).unwrap();
+    assert_eq!(decoded3, "anothercustom", "Decoding 'anothercustom' failed.");
+
+    // Test encoding text that mixes old and new tokens
+    let text_mixed = "hello [NEW_TOKEN_1] world customword";
+    let encoded_mixed = wrapper.encode(text_mixed, false, None).unwrap();
+    // Expected: "hello" -> 5, "[NEW_TOKEN_1]" -> new_token_1_id, "Ġworld" -> 10, "customword" -> customword_id
+    // Note: "Ġworld" because "world" is preceded by a space after "[NEW_TOKEN_1]".
+    // However, if "[NEW_TOKEN_1]" is treated like a word, then " world" might be "Ġworld".
+    // The pretokenizer (BertPretokenizer) will split by space.
+    // "[NEW_TOKEN_1]" is a token. "world" is a token. "customword" is a token.
+    // "hello", "[NEW_TOKEN_1]", "world", "customword"
+    // -> 5, new_token_1_id, 10 (Ġworld), customword_id
+    // It depends on whether "[NEW_TOKEN_1]" is seen as having space-like boundaries by pre_tokenizer.
+    // If "[NEW_TOKEN_1]" is treated as a single unit and pre_tokenizer splits "hello [NEW_TOKEN_1] world..."
+    // into "hello", "[NEW_TOKEN_1]", "world", "customword".
+    // Then IDs: 5 (hello), new_token_1_id, 10 (Ġworld), customword_id
+    // Let's assume the more direct mapping for now.
+    // The BertPreTokenizer behavior with added tokens can be complex.
+    // For this dummy tokenizer, "[NEW_TOKEN_1]" is a word. "customword" is a word.
+    // So, "hello", "[NEW_TOKEN_1]", "world", "customword"
+    // "hello" -> 5
+    // "[NEW_TOKEN_1]" -> new_token_1_id
+    // "world" -> (will be prefixed by "Ġ" by BPE if not first word) -> 10
+    // "customword" -> customword_id
+    // Expected: [5, new_token_1_id, 10, customword_id]
+    let expected_mixed_ids = vec![5, new_token_1_id, 10, customword_id];
+    assert_eq!(encoded_mixed, expected_mixed_ids, "Encoding mixed text with new tokens failed.");
+}
+    let text1 = "[CLS] [SEP]";
+    // add_special_tokens: false -> BertPreTokenizer gives "[CLS]", "[SEP]". These are in vocab.
+    // Expected: [2, 3]
+    let res1_no_special = wrapper.encode(text1, false, None).unwrap();
+    assert_eq!(res1_no_special, vec![2, 3], "Encoding '[CLS] [SEP]' (no special) failed.");
+
+    // add_special_tokens: true -> Input is tokenized to [2,3]. Post-processor adds CLS/SEP around this.
+    // Expected: [2, 2, 3, 3] ([CLS] [CLS] [SEP] [SEP])
+    let res1_special = wrapper.encode(text1, true, None).unwrap();
+    assert_eq!(res1_special, vec![2, 2, 3, 3], "Encoding '[CLS] [SEP]' (with special) failed.");
+
+    // Test case 2: "[UNK] [MASK]"
+    let text2 = "[UNK] [MASK]";
+    // add_special_tokens: false -> BertPreTokenizer gives "[UNK]", "[MASK]". These are in vocab.
+    // Expected: [1, 4]
+    let res2_no_special = wrapper.encode(text2, false, None).unwrap();
+    assert_eq!(res2_no_special, vec![1, 4], "Encoding '[UNK] [MASK]' (no special) failed.");
+
+    // add_special_tokens: true -> Input is tokenized to [1,4]. Post-processor adds CLS/SEP around this.
+    // Expected: [2, 1, 4, 3] ([CLS] [UNK] [MASK] [SEP])
+    let res2_special = wrapper.encode(text2, true, None).unwrap();
+    assert_eq!(res2_special, vec![2, 1, 4, 3], "Encoding '[UNK] [MASK]' (with special) failed.");
+
+    // Test case 3: "hello [SEP]"
+    let text3 = "hello [SEP]";
+    // add_special_tokens: false -> "hello", "[SEP]" -> [5, 3]
+    let res3_no_special = wrapper.encode(text3, false, None).unwrap();
+    assert_eq!(res3_no_special, vec![5, 3], "Encoding 'hello [SEP]' (no special) failed.");
+
+    // add_special_tokens: true -> Input [5,3]. Post-processor: [2, 5, 3, 3]
+    let res3_special = wrapper.encode(text3, true, None).unwrap();
+    assert_eq!(res3_special, vec![2, 5, 3, 3], "Encoding 'hello [SEP]' (with special) failed.");
 }

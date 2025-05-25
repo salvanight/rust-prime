@@ -48,7 +48,6 @@ impl TransformerBlock {
 /// It now also stores its `GPT2Config`.
 #[derive(Debug)]
 pub struct GPT2Model {
-    config: GPT2Config, // Added config field
     wte_weight: ArrayD<f32>, // Token embeddings
     wpe_weight: ArrayD<f32>, // Positional embeddings
     h: Vec<TransformerBlock>,
@@ -78,35 +77,12 @@ impl GPT2Model {
         let ln_f = LayerNorm::new()?;
         
         Ok(Self {
-            config: config.clone(), // Store a clone of the config
             wte_weight,
             wpe_weight,
             h,
             ln_f,
         })
     }
-
-    /// Retrieves the token embeddings for a given sequence of token IDs.
-    ///
-    /// **Note:** This is currently a placeholder implementation and returns zeros
-    /// of the expected shape. A full implementation would use the model's
-    /// word token embeddings (`wte`) and word position embeddings (`wpe`).
-    ///
-    /// # Arguments
-    /// * `tokens`: A slice of `u32` token IDs for which to retrieve embeddings.
-    ///
-    /// # Returns
-    /// A `Result` containing an `ArrayD<f32>` with the shape `[1, num_tokens, n_embd]`
-    /// representing the embeddings, or an error string if `tokens` is empty or
-    /// another issue occurs.
-    pub fn get_embeddings(&self, tokens: &[u32]) -> Result<ArrayD<f32>, String> {
-        if tokens.is_empty() {
-            return Err("Input token list cannot be empty.".to_string());
-        }
-
-        let batch_size = 1; // Assuming batch size of 1 for this context
-        let seq_len = tokens.len();
-        let n_embd = self.config.n_embd as usize;
 
         // --- 1. Token Embeddings (WTE) ---
         let wte_view: ArrayView2<f32> = self.wte_weight.view().into_dimensionality::<ndarray::Ix2>()
