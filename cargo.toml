@@ -13,6 +13,7 @@ serde_json = "1.0.108"
 safetensors = "0.4.0"
 clap = { version = "4.4.8", features = ["derive"] }
 ndarray-stats = "0.5.1" # Added for GatingLayer (QuantileExt, etc.)
+sysinfo = "0.29.0" # Added for system monitoring
 
 [[bin]]
 name = "repl"
