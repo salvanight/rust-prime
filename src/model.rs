@@ -44,6 +44,7 @@ impl TransformerBlock {
 
 #[derive(Debug)]
 pub struct GPT2Model {
+    config: GPT2Config, // Added config field
     wte_weight: ArrayD<f32>, // Token embeddings
     wpe_weight: ArrayD<f32>, // Positional embeddings
     h: Vec<TransformerBlock>,
@@ -63,11 +64,25 @@ impl GPT2Model {
         let ln_f = LayerNorm::new()?;
         
         Ok(Self {
+            config: config.clone(), // Store a clone of the config
             wte_weight,
             wpe_weight,
             h,
             ln_f,
         })
+    }
+
+    pub fn get_embeddings(&self, tokens: &[u32]) -> Result<ArrayD<f32>, String> {
+        // Placeholder implementation - actual embedding lookup would happen here.
+        // For now, returns zeros of the expected shape [1, num_tokens, n_embd].
+        if tokens.is_empty() {
+            return Err("Cannot get embeddings for empty token list".to_string());
+        }
+        let num_tokens = tokens.len();
+        let n_embd = self.config.n_embd as usize;
+        // In a real scenario, you would use self.wte (word token embeddings)
+        // and self.wpe (word position embeddings) here.
+        Ok(ArrayD::zeros(IxDyn(&[1, num_tokens, n_embd])))
     }
 
     pub fn forward(
