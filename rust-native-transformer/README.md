@@ -75,6 +75,7 @@ You can obtain tokenizer files and convert Hugging Face pre-trained models (e.g.
 *   Complete GPT-2 architecture implementation in pure Rust.
 *   Loading of `.safetensors` weights (F32).
 *   Native BPE Tokenizer.
+*   KV Caching for efficient sequential decoding.
 *   Greedy decoding for text generation.
 *   Functional CLI for inference.
 *   No external C/Python library dependencies for core logic.
@@ -93,7 +94,7 @@ This project is under active development. Key areas for improvement include:
     *   Support for other data types (e.g., F16).
     *   Develop a basic internal profiler for benchmarking operations.
 *   **`transformer_core.rs`:**
-    *   Implement KV Caching for efficient generation with long contexts.
+    *   Further optimizations for attention mechanisms and memory usage.
 *   **`text_generator.rs`:**
     *   Refactor to support multiple sampling strategies (Top-K, Top-P).
     *   Implement `TopKDecoder`, `TopPDecoder` traits.
