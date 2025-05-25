@@ -3,6 +3,7 @@
 use crate::moe::Expert; // Assuming moe.rs is in src/ and contains pub trait Expert
 use crate::gating::GatingLayer; // Assuming gating.rs is in src/
 use crate::system_resources::SystemResources; // Assuming system_resources.rs is in src/
+use crate::cache_tier::{CacheTier, filter_experts_by_tier}; // Added for cache tier filtering
 
 // For Array types if they are used in fields or method signatures directly in this file
 use ndarray::{ArrayD, Array1};
@@ -19,6 +20,7 @@ pub struct MoEOrchestrator {
     pub high_cpu_load_threshold: f32,      // e.g., 0.80 (80% load average for 1 min)
     pub num_experts_in_high_load: usize,   // Number of experts to use if CPU is high (e.g., 1)
     pub default_top_k_experts: usize,      // Default number of experts to try activating if no constraints hit
+    pub current_allowed_tiers: Vec<CacheTier>, 
 }
 
 impl MoEOrchestrator {
@@ -42,6 +44,7 @@ impl MoEOrchestrator {
             high_cpu_load_threshold: cpu_high_threshold,
             num_experts_in_high_load: experts_on_high_cpu,
             default_top_k_experts: default_k,
+            current_allowed_tiers: vec![CacheTier::L1, CacheTier::L2, CacheTier::L3, CacheTier::RAM],
         }
     }
 
@@ -112,14 +115,26 @@ impl MoEOrchestrator {
 
         // 4. Select top 'num_to_activate' experts based on gating scores
         let mut indexed_scores: Vec<(usize, f32)> = gating_scores.iter().enumerate().map(|(i, &s)| (i, s)).collect();
-        indexed_scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
+
+        // Filter by cache tier BEFORE sorting and truncating by num_to_activate
+        let tier_filtered_indexed_scores = filter_experts_by_tier(
+            &indexed_scores,
+            &self.experts, // self.experts is Vec<Box<dyn Expert>> which now requires ExpertTagged
+            &self.current_allowed_tiers
+        );
+
+        // Sort the tier-filtered scores
+        let mut sorted_tier_filtered_scores = tier_filtered_indexed_scores;
+        sorted_tier_filtered_scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
         
-        // Slice to get the actual top experts to be activated
-        let selected_experts_indices_and_scores = &indexed_scores[..num_to_activate.min(indexed_scores.len())]; // Ensure slice is not out of bounds
+        // Slice to get the actual top experts to be activated from the sorted and filtered list
+        let selected_experts_indices_and_scores = &sorted_tier_filtered_scores[..num_to_activate.min(sorted_tier_filtered_scores.len())]; // Ensure slice is not out of bounds
 
         if selected_experts_indices_and_scores.is_empty() && num_to_activate > 0 {
-            // This could happen if num_to_activate > 0 but indexed_scores is empty (e.g. all gating scores were NaN)
-            return Err("No experts could be selected based on gating scores (e.g., all scores were NaN).".to_string());
+            // This could happen if num_to_activate > 0 but the filtered list is empty or all gating scores were NaN
+            // Consider if a different message is needed if tier_filtered_indexed_scores was non-empty but became empty after sorting (e.g. NaNs)
+            // For now, this message is general enough.
+            return Err("No experts could be selected based on gating scores and tier filtering (e.g., all scores were NaN or no experts in allowed tiers).".to_string());
         }
 
         // 5. Re-normalize scores of the selected experts so they sum to 1
@@ -198,5 +213,132 @@ impl MoEOrchestrator {
         
         // final_output_accumulator should be Some if active_experts_with_scores was not empty.
         final_output_accumulator.ok_or_else(|| "No expert outputs processed, final_output_accumulator is None.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::moe::{MLPExpert, SymbolicExpert, Expert}; // Added Expert here
+    use crate::gating::GatingLayer;
+    use crate::cache_tier::CacheTier;
+    use ndarray::Array1;
+
+    // Helper to create a default orchestrator for tests
+    fn setup_orchestrator(experts: Vec<Box<dyn Expert>>, num_features: usize, num_experts_in_gating: usize) -> MoEOrchestrator {
+        let gating_layer = GatingLayer::new(num_features, num_experts_in_gating);
+        MoEOrchestrator::new(
+            experts,
+            gating_layer,
+            None,    // max_concurrent_experts_override
+            0.5,     // min_ram_gb_per_expert
+            0.8,     // high_cpu_load_threshold
+            1,       // num_experts_in_high_load
+            3        // default_top_k_experts
+        )
+    }
+
+    #[test]
+    fn test_orchestrator_tier_l1_only() {
+        let experts_vec: Vec<Box<dyn Expert>> = vec![
+            Box::new(SymbolicExpert::new("L1_Expert", 0.5)), // Index 0, L1
+            Box::new(MLPExpert::new("L2_Expert")),          // Index 1, L2
+        ];
+        let num_experts = experts_vec.len();
+        let mut orchestrator = setup_orchestrator(experts_vec, 3, num_experts);
+        orchestrator.current_allowed_tiers = vec![CacheTier::L1];
+        orchestrator.default_top_k_experts = 2; 
+
+        let input_features = Array1::zeros(3); 
+        let result = orchestrator.determine_active_experts(&input_features, 0.0);
+        assert!(result.is_ok(), "Result should be Ok");
+        let active_experts = result.unwrap();
+
+        assert_eq!(active_experts.len(), 1, "Should only select one L1 expert");
+        assert_eq!(active_experts[0].0, 0, "Selected expert should be L1_Expert (index 0)");
+    }
+
+    #[test]
+    fn test_orchestrator_tier_l2_only() {
+        let experts_vec: Vec<Box<dyn Expert>> = vec![
+            Box::new(SymbolicExpert::new("L1_Expert", 0.5)), // Index 0, L1
+            Box::new(MLPExpert::new("L2_Expert")),          // Index 1, L2
+        ];
+        let num_experts = experts_vec.len();
+        let mut orchestrator = setup_orchestrator(experts_vec, 3, num_experts);
+        orchestrator.current_allowed_tiers = vec![CacheTier::L2];
+        orchestrator.default_top_k_experts = 2;
+
+        let input_features = Array1::zeros(3);
+        let result = orchestrator.determine_active_experts(&input_features, 0.0);
+        assert!(result.is_ok(), "Result should be Ok");
+        let active_experts = result.unwrap();
+        
+        assert_eq!(active_experts.len(), 1, "Should only select one L2 expert");
+        assert_eq!(active_experts[0].0, 1, "Selected expert should be L2_Expert (index 1)");
+    }
+
+    #[test]
+    fn test_orchestrator_tier_l1_and_l2_allowed() {
+        let experts_vec: Vec<Box<dyn Expert>> = vec![
+            Box::new(SymbolicExpert::new("L1_Expert", 0.5)), // Index 0, L1
+            Box::new(MLPExpert::new("L2_Expert")),          // Index 1, L2
+            Box::new(MLPExpert::new("L2_Expert_2")),        // Index 2, L2
+        ];
+        let num_experts = experts_vec.len();
+        let mut orchestrator = setup_orchestrator(experts_vec, 3, num_experts);
+        orchestrator.current_allowed_tiers = vec![CacheTier::L1, CacheTier::L2];
+        orchestrator.default_top_k_experts = 3;
+
+        let input_features = Array1::zeros(3);
+        let result = orchestrator.determine_active_experts(&input_features, 0.0);
+        assert!(result.is_ok(), "Result should be Ok");
+        let active_experts = result.unwrap();
+        
+        assert_eq!(active_experts.len(), 3, "Should select all three experts");
+        assert!(active_experts.iter().any(|&(idx, _)| idx == 0));
+        assert!(active_experts.iter().any(|&(idx, _)| idx == 1));
+        assert!(active_experts.iter().any(|&(idx, _)| idx == 2));
+    }
+
+    #[test]
+    fn test_orchestrator_no_tiers_match() {
+        let experts_vec: Vec<Box<dyn Expert>> = vec![
+            Box::new(SymbolicExpert::new("L1_Expert", 0.5)),
+            Box::new(MLPExpert::new("L2_Expert")),
+        ];
+        let num_experts = experts_vec.len();
+        let mut orchestrator = setup_orchestrator(experts_vec, 3, num_experts);
+        orchestrator.current_allowed_tiers = vec![CacheTier::L3];
+        orchestrator.default_top_k_experts = 2;
+
+        let input_features = Array1::zeros(3);
+        let result = orchestrator.determine_active_experts(&input_features, 0.0);
+        assert!(result.is_ok(), "Result should be Ok");
+        let active_experts = result.unwrap();
+        assert!(active_experts.is_empty(), "Should select no experts if no tiers match");
+    }
+
+    #[test]
+    fn test_orchestrator_tier_filter_then_top_k_limit() {
+        let experts_vec: Vec<Box<dyn Expert>> = vec![
+            Box::new(SymbolicExpert::new("L1_Expert_1", 0.5)), // Index 0, L1
+            Box::new(MLPExpert::new("L2_Expert_1")),          // Index 1, L2
+            Box::new(SymbolicExpert::new("L1_Expert_2", 0.5)), // Index 2, L1
+            Box::new(MLPExpert::new("L2_Expert_2")),          // Index 3, L2
+        ];
+        let num_experts = experts_vec.len();
+        let mut orchestrator = setup_orchestrator(experts_vec, 3, num_experts);
+        orchestrator.current_allowed_tiers = vec![CacheTier::L1]; 
+        orchestrator.default_top_k_experts = 1; 
+
+        let input_features = Array1::zeros(3);
+        let result = orchestrator.determine_active_experts(&input_features, 0.0);
+        assert!(result.is_ok(), "Result should be Ok");
+        let active_experts = result.unwrap();
+        
+        assert_eq!(active_experts.len(), 1, "Should select only 1 expert due to top_k limit");
+        let selected_expert_index = active_experts[0].0;
+        assert!(selected_expert_index == 0 || selected_expert_index == 2, "Selected expert must be one of the L1 experts (index 0 or 2), got {}", selected_expert_index);
     }
 }

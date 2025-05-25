@@ -10,6 +10,7 @@ use std::io::Read; // For load_pre_tokenized_from_json
 pub mod config;
 pub mod common;
 pub mod attention;
+pub mod cache_tier;
 pub mod mlp;
 pub mod model;
 pub mod tokenizer {

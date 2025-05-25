@@ -1,8 +1,9 @@
 use ndarray::{ArrayD, Array1, Axis}; // Added Axis
 use crate::gating::GatingLayer; // Import GatingLayer
+use crate::cache_tier::{CacheTier, ExpertTagged};
 
 // Define the Expert trait
-pub trait Expert: std::fmt::Debug { // Added Debug for easy printing of Box<dyn Expert>
+pub trait Expert: std::fmt::Debug + ExpertTagged { // Added Debug for easy printing of Box<dyn Expert> and ExpertTagged as supertrait
     fn name(&self) -> String;
     // Input: The input tensor for the expert to process.
     // theta_hat: The current intentionality score.
@@ -35,6 +36,12 @@ impl Expert for MLPExpert {
         // let output = input.mapv(|x| x + 0.1); 
         // Ok(output)
         Ok(input.clone()) // Simple pass-through for now
+    }
+}
+
+impl ExpertTagged for MLPExpert {
+    fn cache_tier(&self) -> CacheTier {
+        CacheTier::L2
     }
 }
 
@@ -72,6 +79,12 @@ impl Expert for SymbolicExpert {
             output = output.mapv(|x| x + 0.01); // Default small shift
         }
         Ok(output)
+    }
+}
+
+impl ExpertTagged for SymbolicExpert {
+    fn cache_tier(&self) -> CacheTier {
+        CacheTier::L1
     }
 }
 
