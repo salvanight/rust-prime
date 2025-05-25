@@ -1,4 +1,4 @@
-use ndarray::{ArrayD, IxDyn, Array2, s, Axis}; // Consolidated use statements
+use ndarray::{ArrayD, IxDyn, Array2, s, Axis, ArrayView2}; // Consolidated use statements, added ArrayView2
 use crate::config::GPT2Config;
 use crate::common::{LayerNorm, ModelKVCache}; // Import ModelKVCache
 use crate::attention::MultiHeadAttention;
@@ -34,11 +34,10 @@ impl TransformerBlock {
         layer_kv_cache: &mut Vec<f32>, // Added layer_kv_cache
         _theta_hat: f32 // Added theta_hat, underscore if not used immediately
     ) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
-        // The attention_mask parameter is removed for now.
-        // Cache interaction will implicitly handle attention context.
-        println!("TransformerBlock forward called with hidden_states shape: {:?}, layer_kv_cache length: {}", hidden_states.shape(), layer_kv_cache.len());
-        // Actual implementation will use layer_kv_cache and theta_hat.
-        todo!("Implement TransformerBlock forward pass with cache and theta_hat");
+        // For now, make it a pass-through so the model can "run" structurally.
+        // TODO: Implement actual TransformerBlock forward logic including attention and MLP,
+        // using layer_kv_cache and potentially theta_hat.
+        Ok(hidden_states.clone())
     }
 }
 
@@ -101,68 +100,108 @@ impl GPT2Model {
     /// representing the embeddings, or an error string if `tokens` is empty or
     /// another issue occurs.
     pub fn get_embeddings(&self, tokens: &[u32]) -> Result<ArrayD<f32>, String> {
-        // Placeholder implementation - actual embedding lookup would happen here.
-        // For now, returns zeros of the expected shape [1, num_tokens, n_embd].
         if tokens.is_empty() {
-            return Err("Cannot get embeddings for empty token list".to_string());
+            return Err("Input token list cannot be empty.".to_string());
         }
-        let num_tokens = tokens.len();
+
+        let batch_size = 1; // Assuming batch size of 1 for this context
+        let seq_len = tokens.len();
         let n_embd = self.config.n_embd as usize;
-        // In a real scenario, you would use self.wte (word token embeddings)
-        // and self.wpe (word position embeddings) here.
-        Ok(ArrayD::zeros(IxDyn(&[1, num_tokens, n_embd])))
-    }
 
-    pub fn forward(
-        &mut self, // Changed to &mut self
-        input_ids: &Array2<i32>, 
-        model_cache: &mut ModelKVCache, // Added model_cache
-        theta_hat: f32 // Added theta_hat
-    ) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
-        let batch_size = input_ids.shape()[0];
-        let seq_len = input_ids.shape()[1];
+        // --- 1. Token Embeddings (WTE) ---
+        let wte_view: ArrayView2<f32> = self.wte_weight.view().into_dimensionality::<ndarray::Ix2>()
+            .map_err(|e| format!("Failed to view wte_weight as 2D array: {}", e))?;
+
+        let mut token_embedding_data = Vec::with_capacity(seq_len * n_embd);
+        for &token_id in tokens {
+            if (token_id as usize) < wte_view.shape()[0] {
+                let embedding_vector = wte_view.row(token_id as usize);
+                token_embedding_data.extend(embedding_vector.iter());
+            } else {
+                return Err(format!("Token ID {} is out of vocab size {}.", token_id, wte_view.shape()[0]));
+            }
+        }
+        let token_embeddings = ArrayD::from_shape_vec(IxDyn(&[batch_size, seq_len, n_embd]), token_embedding_data)
+            .map_err(|e| format!("Failed to create token_embeddings ArrayD: {}", e))?;
         
-        let n_embd = self.wte_weight.shape()[1]; 
-
-        // 1. Token Embeddings (Placeholder: creating zeros for simplicity)
-        // In a real implementation, this would use self.wte_weight.embedding(input_ids)
-        let token_embeddings = ArrayD::zeros((batch_size, seq_len, n_embd).into_dyn());
-
-        // 2. Positional Embeddings
+        // --- 2. Positional Embeddings (WPE) ---
         if seq_len > self.wpe_weight.shape()[0] {
             return Err(format!(
                 "Sequence length ({}) exceeds maximum positional embeddings ({})",
                 seq_len, self.wpe_weight.shape()[0]
-            ).into());
+            ));
         }
+        // Slice wpe_weight: take rows from 0 to seq_len-1
         let positional_embeddings_slice = self.wpe_weight.slice(s![..seq_len, ..]);
-        let positional_embeddings_owned: ArrayD<f32> = positional_embeddings_slice.to_owned().into_dyn();
-        let positional_embeddings_broadcastable = positional_embeddings_owned.insert_axis(Axis(0));
-        
-        let mut hidden_states = token_embeddings + positional_embeddings_broadcastable;
-        // println!("Initial hidden_states shape: {:?}", hidden_states.shape());
+        // Convert to owned ArrayD and add batch axis
+        let positional_embeddings_broadcastable = positional_embeddings_slice
+            .to_owned()
+            .into_dyn()
+            .insert_axis(Axis(0)); // Shape: [1, seq_len, n_embd]
 
-        // 3. Pass through Transformer Blocks
-        for (i, block) in self.h.iter_mut().enumerate() {
-            // Each block updates hidden_states.
-            // It also uses/updates its corresponding part of the model_cache.
-            // model_cache is Vec<Vec<f32>>, so model_cache[i] is Vec<f32>
-            hidden_states = block.forward(&hidden_states, &mut model_cache[i], theta_hat)?;
-            // println!("Hidden_states shape after block {}: {:?}", i, hidden_states.shape());
+        if positional_embeddings_broadcastable.shape() != [batch_size, seq_len, n_embd] {
+             return Err(format!(
+                "Shape mismatch for positional embeddings. Expected: {:?}, Got: {:?}",
+                [batch_size, seq_len, n_embd], positional_embeddings_broadcastable.shape()
+            ));
         }
-        
-        // 4. Final Layer Normalization
-        hidden_states = self.ln_f.forward(&hidden_states)?;
-        // println!("Hidden_states shape after ln_f: {:?}", hidden_states.shape());
+        if token_embeddings.shape() != [batch_size, seq_len, n_embd] {
+             return Err(format!(
+                "Shape mismatch for token embeddings. Expected: {:?}, Got: {:?}",
+                [batch_size, seq_len, n_embd], token_embeddings.shape()
+            ));
+        }
 
-        // 5. Language Model Head (Placeholder)
-        // The actual lm_head would be a linear layer mapping hidden_states (n_embd) to vocab_size.
-        // For now, returning the processed hidden_states.
-        // This needs to be updated to return logits of shape [batch_size, seq_len, vocab_size].
-        // Example: let logits = self.lm_head.forward(&hidden_states)?;
+        // --- 3. Combine Embeddings ---
+        Ok(&token_embeddings + &positional_embeddings_broadcastable)
+    }
+
+    pub fn forward(
+        &mut self,
+        input_ids: &Array2<i32>, 
+        model_cache: &mut ModelKVCache,
+        theta_hat: f32
+    ) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
+        let batch_size = input_ids.shape()[0];
+        // let seq_len = input_ids.shape()[1]; // Not directly used after refactor to get_embeddings
+
+        // 1. Get initial hidden states using get_embeddings
+        // Convert Array2<i32> to Vec<u32> or &[u32] for get_embeddings.
+        // Assuming batch_size is 1 for now as get_embeddings expects &[u32] (a single sequence).
+        if batch_size != 1 {
+            // TODO: Support batch_size > 1 in get_embeddings or handle here.
+            return Err(Box::from("GPT2Model::forward currenty only supports batch_size = 1 due to get_embeddings input type."));
+        }
+        let tokens_for_embedding: Vec<u32> = input_ids.iter().map(|&id| id as u32).collect();
         
-        // For now, we return hidden_states. The caller in main.rs expects logits.
-        // This will be addressed when lm_head is implemented.
+        let mut hidden_states = self.get_embeddings(&tokens_for_embedding)
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::from(e) })?;
+        // Expected shape from get_embeddings: [1, seq_len, n_embd]
+
+        // 2. Pass through Transformer Blocks
+        // Ensure model_cache has the correct number of layers
+        if model_cache.len() != self.h.len() {
+            return Err(Box::from(format!(
+                "model_cache length ({}) does not match number of transformer blocks ({}).",
+                model_cache.len(), self.h.len()
+            )));
+        }
+
+        for (i, block) in self.h.iter_mut().enumerate() {
+            // Each block updates hidden_states and uses/updates its part of model_cache.
+            hidden_states = block.forward(&hidden_states, &mut model_cache[i], theta_hat)?;
+        }
+
+        // 3. Final Layer Normalization
+        hidden_states = self.ln_f.forward(&hidden_states)
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::from(e) })?;
+            // Assuming ln_f.forward also returns Result<ArrayD<f32>, Box<dyn Error>>
+            // If it returns Result<ArrayD<f32>, String>, adapt error mapping.
+
+        // 4. Language Model Head (Placeholder)
+        // TODO: Implement lm_head to map hidden_states (n_embd) to vocab_size logits.
+        // For now, returning the processed hidden_states.
+        // The REPL currently expects logits from orchestrator.forward, which uses this model's output.
         Ok(hidden_states) 
     }
 }
