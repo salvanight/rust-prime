@@ -98,13 +98,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Re-use model_config and model from GPT2Config loading test.
     // Ensure model is mutable for run_repl_loop.
-    let mut model = crate::model::GPT2Model::new(&gpt2_config) // Use gpt2_config loaded earlier
+    let mut model = rust_transformers_gpt2::ndarray_specific::model::GPT2Model::new(&gpt2_config) // Use gpt2_config loaded earlier
         .expect("Failed to create a GPT2Model instance for REPL execution");
 
     // --- REPL Setup ---
     println!("\n--- Starting Interactive REPL ---");
     // Import REPL functions
-    use rust_transformers_gpt2::repl::{run_repl_loop, get_user_prompt};
+    use rust_transformers_gpt2::ndarray_specific::repl::{run_repl_loop, get_user_prompt};
 
     // Get initial prompt from user
     let prompt_string = get_user_prompt();
