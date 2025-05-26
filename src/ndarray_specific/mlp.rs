@@ -1,3 +1,4 @@
+#![cfg(feature = "ndarray_backend")]
 use ndarray::{ArrayD, IxDyn};
 
 #[derive(Debug)]

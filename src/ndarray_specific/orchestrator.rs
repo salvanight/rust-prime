@@ -1,3 +1,4 @@
+#![cfg(feature = "ndarray_backend")]
 // Ensure these 'use' statements are correct based on your project structure.
 // If moe.rs, gating.rs, system_resources.rs are in src/, then crate::module_name is typical.
 use crate::moe::Expert; // Assuming moe.rs is in src/ and contains pub trait Expert
@@ -8,22 +9,57 @@ use crate::cache_tier::{CacheTier, filter_experts_by_tier}; // Added for cache t
 // For Array types if they are used in fields or method signatures directly in this file
 use ndarray::{ArrayD, Array1};
 
+/// Manages a collection of experts and orchestrates their execution based on gating logic,
+/// system resources, and cache tier policies.
+///
+/// The orchestrator is responsible for selecting which experts to activate for a given input,
+/// potentially adjusting its selection strategy based on real-time conditions such as
+/// CPU load, RAM availability, and symbolic cache tiering rules.
+///
+/// In the REPL context, the `current_allowed_tiers` field is dynamically updated based
+/// on system RAM and the intentionality score (θ̂) to guide expert selection.
 #[derive(Debug)] // Added Debug derive
 pub struct MoEOrchestrator {
+    /// The collection of experts managed by this orchestrator.
     pub experts: Vec<Box<dyn Expert>>,
+    /// Holds information about current system resources (CPU, RAM).
+    /// This is refreshed internally during operation (e.g., in `determine_active_experts`).
     pub system_status: SystemResources, // Will be refreshed
+    /// The gating layer used to score experts for selection.
     pub gating_layer: GatingLayer,
     
     // Configuration for orchestration logic
+    /// If Some, overrides dynamic calculation of how many experts to run concurrently.
     pub max_concurrent_experts_override: Option<usize>, // If Some, overrides dynamic calculation
+    /// Minimum RAM (in GB) deemed necessary per expert for dynamic calculation.
     pub min_ram_gb_per_expert: f32,        // e.g., 0.5 GB per expert
+    /// CPU load average (e.g., 1-minute load) threshold to trigger constrained expert selection.
     pub high_cpu_load_threshold: f32,      // e.g., 0.80 (80% load average for 1 min)
+    /// Number of experts to use if CPU load is high and no override is set.
     pub num_experts_in_high_load: usize,   // Number of experts to use if CPU is high (e.g., 1)
+    /// Default number of top-K experts to try activating if no other constraints are hit.
     pub default_top_k_experts: usize,      // Default number of experts to try activating if no constraints hit
+    /// Current list of `CacheTier`s that are allowed for expert activation.
+    /// This policy can be dynamically updated (e.g., by the REPL based on system state).
     pub current_allowed_tiers: Vec<CacheTier>, 
 }
 
 impl MoEOrchestrator {
+    /// Creates a new `MoEOrchestrator`.
+    ///
+    /// Initializes the orchestrator with a set of experts, a gating layer, and various
+    /// configuration parameters that define its behavior under different system conditions.
+    /// The `current_allowed_tiers` policy is initialized to allow all cache tiers by default;
+    /// this can be changed dynamically during runtime (e.g., by the REPL).
+    ///
+    /// # Arguments
+    /// * `experts`: A vector of boxed `Expert` trait objects.
+    /// * `gating_layer`: The `GatingLayer` to be used for scoring experts.
+    /// * `max_concurrent_override`: Optional override for the number of concurrent experts.
+    /// * `ram_per_expert_gb`: Estimated RAM needed per expert, for resource calculations.
+    /// * `cpu_high_threshold`: CPU load threshold for constrained mode.
+    /// * `experts_on_high_cpu`: Number of experts to use in high CPU load mode.
+    /// * `default_k`: Default number of top-K experts to activate.
     pub fn new(
         experts: Vec<Box<dyn Expert>>,
         gating_layer: GatingLayer,
@@ -50,8 +86,25 @@ impl MoEOrchestrator {
 
     // Other methods (determine_active_experts, forward) will be added later.
 
-    // Determines which experts to activate and their re-normalized scores.
-    // Returns a Vec of (expert_index, normalized_score).
+    /// Determines which experts to activate and their re-normalized scores.
+    ///
+    /// This method performs several steps:
+    /// 1. Refreshes the `system_status` (RAM, CPU load).
+    /// 2. Calculates the maximum number of experts to activate (`num_to_activate`) based on
+    ///    `default_top_k_experts`, resource constraints (RAM, CPU), and any overrides.
+    /// 3. Retrieves gating scores for all experts from the `gating_layer`.
+    /// 4. Filters these scored experts based on the `current_allowed_tiers` policy.
+    /// 5. Selects the top `num_to_activate` experts from the tier-filtered list.
+    /// 6. Re-normalizes the scores of these selected experts so they sum to 1.0.
+    ///
+    /// # Arguments
+    /// * `self`: Takes `&mut self` to allow refreshing `system_status`.
+    /// * `input_1d_features`: A 1D array of features for the gating layer (e.g., embedding of the current token).
+    /// * `_theta_hat`: The current intentionality score (currently unused in selection logic but available).
+    ///
+    /// # Returns
+    /// A `Result` containing a `Vec` of `(expert_index, normalized_score)` tuples for the
+    /// selected experts, or an error string if issues occur (e.g., gating mismatch, no experts selectable).
     pub fn determine_active_experts(
         &mut self, // Takes &mut self to refresh system_status
         input_1d_features: &Array1<f32>,
@@ -158,6 +211,29 @@ impl MoEOrchestrator {
         Ok(final_selected_experts)
     }
 
+    /// Processes an input through the selected mixture of experts.
+    ///
+    /// This method orchestrates the end-to-end forward pass:
+    /// 1. Calls `determine_active_experts` to get a list of experts to activate and their scores.
+    /// 2. For each selected expert, calls its `forward` method with `full_input_tensor` and `theta_hat`.
+    /// 3. Combines the outputs of the activated experts, weighted by their re-normalized scores.
+    ///    The combined output is assumed to be token logits.
+    /// 4. Collects details (name and cache tier) of the experts that were activated.
+    ///
+    /// # Arguments
+    /// * `self`: Takes `&mut self` as `determine_active_experts` needs it.
+    /// * `input_1d_features`: A 1D array of features, typically for the gating layer to decide
+    ///   which experts to activate (e.g., current token's embedding).
+    /// * `full_input_tensor`: The primary input tensor for the experts themselves
+    ///   (e.g., sequence of embeddings).
+    /// * `theta_hat`: The current intentionality score, passed to each activated expert.
+    ///
+    /// # Returns
+    /// A `Result` which, on success, contains a tuple:
+    ///   - `ArrayD<f32>`: The combined output tensor from the experts (assumed to be token logits).
+    ///   - `Vec<(String, CacheTier)>`: A list of tuples, where each contains the name
+    ///     and `CacheTier` of an expert that was activated during this forward pass.
+    /// On failure, returns an error string.
     pub fn forward(
         &mut self, // Takes &mut self to allow determine_active_experts to refresh system_status
         input_1d_features: &Array1<f32>,
