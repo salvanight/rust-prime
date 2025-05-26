@@ -1,3 +1,4 @@
+#![cfg(feature = "ndarray_backend")]
 use ndarray::{ArrayD, IxDyn, Array2, s, Axis, ArrayView2}; // Consolidated use statements, added ArrayView2
 use crate::config::GPT2Config;
 use crate::common::{LayerNorm, ModelKVCache}; // Import ModelKVCache

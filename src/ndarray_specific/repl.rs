@@ -3,23 +3,23 @@ use std::error::Error; // For Box<dyn Error>
 use std::path::PathBuf; // For feedback store path
 
 // Module for feedback mechanism
-mod repl_feedback;
-use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
+// mod repl_feedback; // This was local, now use crate::repl_feedback
+use crate::repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
 
 use std::path::Path; // For tokenizer path
 
-// Module for feedback mechanism
-mod repl_feedback;
-use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
+// Module for feedback mechanism (duplicate removed)
+// mod repl_feedback;
+// use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
 
-// Module for tokenizer
-mod tokenizer;
-use tokenizer::TokenizerWrapper; // Use the new TokenizerWrapper
+// Module for tokenizer (local `mod tokenizer;` declaration removed)
+use crate::tokenizer::TokenizerWrapper; // Use the TokenizerWrapper from lib.rs
 
 // Imports for token generation logic
 use ndarray::{s, ArrayD, Array2, Axis, ArrayView1}; // Added s and Axis, ArrayView1
-use crate::model::{GPT2Model, GPT2Config};
-use crate::common::ModelKVCache;
+use super::model::GPT2Model; // model is now a sibling module
+use crate::config::GPT2Config; // config is top-level
+use super::common::ModelKVCache; // common is now a sibling module
 // Removed: use crate::tokenizer::GPT2Tokenizer; 
 
 pub fn get_user_prompt() -> String {

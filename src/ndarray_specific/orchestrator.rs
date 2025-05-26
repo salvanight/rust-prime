@@ -1,3 +1,4 @@
+#![cfg(feature = "ndarray_backend")]
 // Ensure these 'use' statements are correct based on your project structure.
 // If moe.rs, gating.rs, system_resources.rs are in src/, then crate::module_name is typical.
 use crate::moe::Expert; // Assuming moe.rs is in src/ and contains pub trait Expert

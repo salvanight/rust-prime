@@ -1,3 +1,4 @@
+#![cfg(feature = "ndarray_backend")]
 use ndarray::{ArrayD, Array1, Axis}; // Added Axis
 use crate::gating::GatingLayer; // Import GatingLayer
 use crate::cache_tier::{CacheTier, ExpertTagged};

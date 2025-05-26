@@ -1,3 +1,4 @@
+#![cfg(feature = "ndarray_backend")]
 use ndarray::{Array1, Array2, ArrayD, Axis, IxDyn}; // IxDyn for ArrayD if GatingLayer handles general ArrayD
 use ndarray_stats::QuantileExt; // For arg_max if needed, though softmax output is weights
 
