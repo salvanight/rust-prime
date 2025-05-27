@@ -1,3 +1,4 @@
+#![cfg(feature = "ndarray_backend")]
 use ndarray::{ArrayD, IxDyn};
 // Potentially: use crate::common::*; // If LayerNorm or other common elements are needed directly
 // For now, let's assume it's self-contained or uses types passed in.

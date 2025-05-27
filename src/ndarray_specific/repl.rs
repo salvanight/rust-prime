@@ -3,23 +3,23 @@ use std::error::Error; // For Box<dyn Error>
 use std::path::PathBuf; // For feedback store path
 
 // Module for feedback mechanism
-mod repl_feedback;
-use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
+// mod repl_feedback; // This was local, now use crate::repl_feedback
+use crate::repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
 
 use std::path::Path; // For tokenizer path
 
-// Module for feedback mechanism
-mod repl_feedback;
-use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
+// Module for feedback mechanism (duplicate removed)
+// mod repl_feedback;
+// use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
 
-// Module for tokenizer
-mod tokenizer;
-use tokenizer::TokenizerWrapper; // Use the new TokenizerWrapper
+// Module for tokenizer (local `mod tokenizer;` declaration removed)
+use crate::tokenizer::TokenizerWrapper; // Use the TokenizerWrapper from lib.rs
 
 // Imports for token generation logic
 use ndarray::{s, ArrayD, Array2, Axis, ArrayView1}; // Added s and Axis, ArrayView1
-use crate::model::{GPT2Model, GPT2Config};
-use crate::common::ModelKVCache;
+use super::model::GPT2Model; // model is now a sibling module
+use crate::config::GPT2Config; // config is top-level
+use super::common::ModelKVCache; // common is now a sibling module
 // Removed: use crate::tokenizer::GPT2Tokenizer; 
 
 pub fn get_user_prompt() -> String {
@@ -132,6 +132,39 @@ pub(crate) fn adjust_theta_hat(initial_theta: f32, user_feedback: &str) -> f32 {
     new_theta.max(0.0).min(1.0)
 }
 
+/// Runs the main Read-Eval-Print Loop (REPL) for interactive token generation.
+///
+/// This loop handles user input, token generation, and user feedback.
+/// It now integrates with an `MoEOrchestrator` to dynamically select experts
+/// based on cache tier policies, system resources, and intentionality score (θ̂).
+///
+/// Key operations within the loop:
+/// 1.  **Dynamic Tier Policy Adjustment**: Before each token generation, the
+///     `MoEOrchestrator`'s `current_allowed_tiers` policy is updated based on
+///     available system RAM and the current `theta_hat` value. This logic is
+///     encapsulated in the `determine_and_set_allowed_tiers` helper function.
+/// 2.  **Token Generation via Orchestrator**: Uses `orchestrator.forward()` to generate
+///     the next token's logits. This call also returns information about which
+///     experts were activated.
+/// 3.  **User Validation**: Prompts the user to validate the generated token ("s"atisfied,
+///     "n"ot satisfied, "q"uit).
+/// 4.  **Theta Hat Adjustment**: Adjusts `theta_hat` based on user feedback.
+/// 5.  **Feedback Storage**: Records the generation experience (prompt context,
+///     generated token, validation, theta_hat) to a JSON file.
+/// 6.  **Information Display**: Shows the generated token, its ID, logit value,
+///     the current `theta_hat`, validation status, and a list of activated experts
+///     (name and cache tier) for the generated token.
+///
+/// # Arguments
+/// * `model`: A mutable reference to the `GPT2Model` (used for embedding lookup via `get_embeddings`).
+/// * `config`: A reference to the `GPT2Config`.
+/// * `tokenizer`: A reference to the `TokenizerWrapper` for encoding/decoding tokens.
+/// * `initial_prompt_tokens`: A vector of token IDs for the initial prompt.
+/// * `max_new_tokens`: The maximum number of new tokens to generate in this session.
+/// * `initial_theta_hat`: The starting value for the intentionality score.
+/// * `eos_token_id`: The end-of-sequence token ID to stop generation.
+/// * `store`: A mutable reference to the `ResonanceFeedbackStore` for saving experiences.
+/// * `orchestrator`: A mutable reference to the `MoEOrchestrator` to be used for expert selection and generation.
 #[allow(clippy::too_many_arguments)] 
 pub fn run_repl_loop(
     model: &mut GPT2Model,
@@ -290,7 +323,21 @@ pub fn run_repl_loop(
     Ok(())
 }
 
-// Main function for standalone REPL execution
+/// Main entry point for the standalone REPL application.
+///
+/// This function orchestrates the setup of all necessary components for the REPL session:
+/// 1.  Initializes `GPT2Config` and `GPT2Model`.
+/// 2.  Initializes the `TokenizerWrapper`.
+/// 3.  Initializes the `MoEOrchestrator` with a predefined set of experts (e.g., `SymbolicExpert`, `MLPExpert`)
+///     and a `GatingLayer`. This orchestrator will manage expert activation during token generation.
+/// 4.  Retrieves the user's initial prompt and tokenizes it.
+/// 5.  Initializes the `ResonanceFeedbackStore` for recording user feedback.
+/// 6.  Predicts or sets an initial `theta_hat` (intentionality score).
+/// 7.  Calls `run_repl_loop` to start the interactive session, passing all initialized components,
+///     including the `orchestrator`.
+///
+/// # Returns
+/// `Ok(())` on successful execution, or a `Box<dyn Error>` if any critical setup or runtime error occurs.
 pub fn main() -> Result<(), Box<dyn Error>> {
     println!("--- Standalone REPL Initializing ---");
 
