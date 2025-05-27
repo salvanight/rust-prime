@@ -9,6 +9,9 @@ use std::io::Read; // For load_pre_tokenized_from_json
 
 pub mod native;
 pub mod config;
+pub mod common;
+pub mod accelerator;
+pub mod attention;
 pub mod cache_tier;
 // Conditionally compiled ndarray-specific modules are now under ndarray_specific
 #[cfg(feature = "ndarray_backend")]
