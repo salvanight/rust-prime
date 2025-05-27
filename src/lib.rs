@@ -9,6 +9,7 @@ use std::io::Read; // For load_pre_tokenized_from_json
 
 pub mod config;
 pub mod common;
+pub mod accelerator;
 pub mod attention;
 pub mod cache_tier;
 pub mod mlp;
