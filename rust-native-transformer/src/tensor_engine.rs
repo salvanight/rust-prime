@@ -25,15 +25,16 @@ impl std::fmt::Display for TensorError {
 }
 
 // SIMD specific imports
-// use std::simd::{f32x8, SimdFloat}; 
+use std::simd::f32x8; 
+use std::simd::num::SimdFloat;
+use std::simd::StdFloat;
 
 impl Tensor<f32> {
-    /*
     pub fn gelu_simd(&self) -> Result<Tensor<f32>, TensorError> { // Changed to method
         let mut output_data = vec![0.0f32; self.data.len()]; // Use self
         let mut k_base = 0;
 
-        let simd_lanes = f32x8::lanes();
+        let simd_lanes = f32x8::LEN;
         
         // SIMD Constants
         let simd_half = f32x8::splat(0.5);
@@ -45,10 +46,12 @@ impl Tensor<f32> {
             let x_vec = f32x8::from_slice(&self.data[k_base .. k_base + simd_lanes]); // Use self
             
             // 2. Calculate v = x_vec * simd_inv_sqrt_2
-            let v = x_vec * simd_inv_sqrt_2;
+            let v_for_tanh = x_vec * simd_inv_sqrt_2; // Renamed for clarity
             
-            // 3. Calculate tanh_v = v.simd_tanh()
-            let tanh_v = v.simd_tanh(); 
+            // 3. Calculate tanh_v = (v_for_tanh.exp() - (-v_for_tanh).exp()) / (v_for_tanh.exp() + (-v_for_tanh).exp())
+            let exp_v = StdFloat::exp(v_for_tanh);
+            let exp_neg_v = StdFloat::exp(-v_for_tanh);
+            let tanh_v = (exp_v - exp_neg_v) / (exp_v + exp_neg_v);
             
             // 4. Calculate sum_val = simd_one + tanh_v
             let sum_val = simd_one + tanh_v;
@@ -60,7 +63,7 @@ impl Tensor<f32> {
             let result_vec = simd_half * mul_val;
             
             // 7. Store result_vec back into the output data vector
-            result_vec.write_to_slice(&mut output_data[k_base .. k_base + simd_lanes]);
+            result_vec.copy_to_slice(&mut output_data[k_base .. k_base + simd_lanes]);
             
             k_base += simd_lanes;
         }
@@ -76,7 +79,6 @@ impl Tensor<f32> {
 
         Tensor::new(output_data, self.shape.clone()) // Use self
     }
-    */
 
     pub fn scalar_mul(&self, scalar: f32) -> Result<Tensor<f32>, TensorError> {
         if self.data.is_empty() && self.num_elements() == 0 { // Handle empty tensor
@@ -217,7 +219,6 @@ impl Tensor<f32> {
         Tensor::new(output_data, output_shape)
     }
 
-    /*
     pub fn matmul_simd(&self, other: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
         // 1. Shape checks (self is A, other is B)
         if self.rank() != 2 || other.rank() != 2 {
@@ -272,7 +273,7 @@ impl Tensor<f32> {
                     let b_vec = f32x8::from_array(b_col_elements);
                     
                     // 11. `dot_product_sum += (a_vec * b_vec).reduce_sum();`
-                    dot_product_sum += (a_vec * b_vec).reduce_sum();
+                    dot_product_sum += <f32x8 as SimdFloat>::reduce_sum(a_vec * b_vec);
                     
                     k_idx += 8;
                 }
@@ -293,7 +294,6 @@ impl Tensor<f32> {
         // 16. Return Ok(Tensor::new(output_data, vec![M, N])?)
         Tensor::new(output_data, vec![m, n])
     }
-    */
 }
 
 impl std::error::Error for TensorError {} // Simple implementation, no source needed for these variants
@@ -900,43 +900,62 @@ mod tests {
         // Case 1: K is a multiple of 8
         let a1 = create_random_tensor(vec![2, 16], 0);
         let b1 = create_random_tensor(vec![16, 3], 1);
+        let expected1 = Tensor::matmul(&a1, &b1).unwrap();
+        let actual1 = a1.matmul_simd(&b1).unwrap();
         let expected1 = Tensor::matmul(&a1, &b1).unwrap(); // Changed
         let actual1 = Tensor::matmul(&a1, &b1).unwrap();   // Changed from matmul_simd
+
         assert_tensors_approx_equal(&actual1, &expected1, FLOAT_TOLERANCE);
 
         // Case 2: K is not a multiple of 8
         let a2 = create_random_tensor(vec![3, 10], 2);
         let b2 = create_random_tensor(vec![10, 4], 3);
+        let expected2 = Tensor::matmul(&a2, &b2).unwrap();
+        let actual2 = a2.matmul_simd(&b2).unwrap();
         let expected2 = Tensor::matmul(&a2, &b2).unwrap(); // Changed
         let actual2 = Tensor::matmul(&a2, &b2).unwrap();   // Changed from matmul_simd
+        main
         assert_tensors_approx_equal(&actual2, &expected2, FLOAT_TOLERANCE);
 
         // Case 3: Small matrices
         let a3 = create_random_tensor(vec![1, 5], 4);
         let b3 = create_random_tensor(vec![5, 1], 5);
+
+        let expected3 = Tensor::matmul(&a3, &b3).unwrap();
+        let actual3 = a3.matmul_simd(&b3).unwrap();
         let expected3 = Tensor::matmul(&a3, &b3).unwrap(); // Changed
         let actual3 = Tensor::matmul(&a3, &b3).unwrap();   // Changed from matmul_simd
+        main
         assert_tensors_approx_equal(&actual3, &expected3, FLOAT_TOLERANCE);
         
         // Case 4: Larger, more arbitrary dimensions
         let a4 = create_random_tensor(vec![7, 13], 6);
         let b4 = create_random_tensor(vec![13, 9], 7);
+        let expected4 = Tensor::matmul(&a4, &b4).unwrap();
+        let actual4 = a4.matmul_simd(&b4).unwrap();
         let expected4 = Tensor::matmul(&a4, &b4).unwrap(); // Changed
         let actual4 = Tensor::matmul(&a4, &b4).unwrap();   // Changed from matmul_simd
+        main
         assert_tensors_approx_equal(&actual4, &expected4, FLOAT_TOLERANCE);
         
         // Case 5: K = 1 (tests remainder loop primarily)
         let a5 = create_random_tensor(vec![4, 1], 8);
         let b5 = create_random_tensor(vec![1, 6], 9);
+        let expected5 = Tensor::matmul(&a5, &b5).unwrap();
+        let actual5 = a5.matmul_simd(&b5).unwrap();
         let expected5 = Tensor::matmul(&a5, &b5).unwrap(); // Changed
         let actual5 = Tensor::matmul(&a5, &b5).unwrap();   // Changed from matmul_simd
+        main
         assert_tensors_approx_equal(&actual5, &expected5, FLOAT_TOLERANCE);
 
         // Case 6: K = 8 (tests SIMD loop primarily, no remainder)
         let a6 = create_random_tensor(vec![3, 8], 10);
         let b6 = create_random_tensor(vec![8, 5], 11);
+        let expected6 = Tensor::matmul(&a6, &b6).unwrap();
+        let actual6 = a6.matmul_simd(&b6).unwrap();
         let expected6 = Tensor::matmul(&a6, &b6).unwrap(); // Changed
         let actual6 = Tensor::matmul(&a6, &b6).unwrap();   // Changed from matmul_simd
+        main
         assert_tensors_approx_equal(&actual6, &expected6, FLOAT_TOLERANCE);
     }
 
