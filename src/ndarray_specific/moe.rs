@@ -1,8 +1,16 @@
+#![cfg(feature = "ndarray_backend")]
 use ndarray::{ArrayD, Array1, Axis}; // Added Axis
 use crate::gating::GatingLayer; // Import GatingLayer
+use crate::cache_tier::{CacheTier, ExpertTagged};
 
-// Define the Expert trait
-pub trait Expert: std::fmt::Debug { // Added Debug for easy printing of Box<dyn Expert>
+/// Defines the interface for an expert in the Mixture of Experts (MoE) system.
+///
+/// Experts are responsible for processing input tensors based on their specialization
+/// and an intentionality score (`theta_hat`).
+///
+/// Effective from recent updates, this trait now requires implementers to also
+/// implement `ExpertTagged`, indicating their symbolic cache tier.
+pub trait Expert: std::fmt::Debug + ExpertTagged { 
     fn name(&self) -> String;
     // Input: The input tensor for the expert to process.
     // theta_hat: The current intentionality score.
@@ -35,6 +43,14 @@ impl Expert for MLPExpert {
         // let output = input.mapv(|x| x + 0.1); 
         // Ok(output)
         Ok(input.clone()) // Simple pass-through for now
+    }
+}
+
+/// Associates `MLPExpert` with the `CacheTier::L2`.
+impl ExpertTagged for MLPExpert {
+    /// Returns `CacheTier::L2`, indicating this expert's symbolic cache tier.
+    fn cache_tier(&self) -> CacheTier {
+        CacheTier::L2
     }
 }
 
@@ -72,6 +88,14 @@ impl Expert for SymbolicExpert {
             output = output.mapv(|x| x + 0.01); // Default small shift
         }
         Ok(output)
+    }
+}
+
+/// Associates `SymbolicExpert` with the `CacheTier::L1`.
+impl ExpertTagged for SymbolicExpert {
+    /// Returns `CacheTier::L1`, indicating this expert's symbolic cache tier.
+    fn cache_tier(&self) -> CacheTier {
+        CacheTier::L1
     }
 }
 

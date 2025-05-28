@@ -3,24 +3,25 @@ use std::error::Error; // For Box<dyn Error>
 use std::path::PathBuf; // For feedback store path
 
 // Module for feedback mechanism
-mod repl_feedback;
-use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
+// mod repl_feedback; // This was local, now use crate::repl_feedback
+use crate::repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
 
 use std::path::Path; // For tokenizer path
 
-// Module for feedback mechanism
-mod repl_feedback;
-use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
+// Module for feedback mechanism (duplicate removed)
+// mod repl_feedback;
+// use repl_feedback::{ResonanceFeedbackStore, ExperienceEntry};
 
-// Module for tokenizer
-mod tokenizer;
-use tokenizer::TokenizerWrapper; // Use the new TokenizerWrapper
+// Module for tokenizer (local `mod tokenizer;` declaration removed)
+use crate::tokenizer::TokenizerWrapper; // Use the TokenizerWrapper from lib.rs
 
 // Imports for token generation logic
-use ndarray::{s, ArrayD, Array2, Axis, ArrayView1}; // Added s and Axis, ArrayView1
+// use ndarray::{s, ArrayD, Array2, Axis, ArrayView1}; // Added s and Axis, ArrayView1 - Commenting out as CpuTensor replaces these for main logic
 use crate::model::{GPT2Model, GPT2Config};
 use crate::common::ModelKVCache;
 // Removed: use crate::tokenizer::GPT2Tokenizer; 
+use crate::accelerator::{Accelerator, Device, Module, CpuTensor, Tensor};
+
 
 pub fn get_user_prompt() -> String {
     print!("Enter your prompt: ");
@@ -31,69 +32,82 @@ pub fn get_user_prompt() -> String {
 }
 
 pub fn prefill_prompt(
-    model: &mut GPT2Model,
-    _config: &GPT2Config,
+    model: &GPT2Model, // Changed from &mut GPT2Model
     prompt_tokens: &[u32],
-    model_cache: &mut ModelKVCache,
-    theta_hat: f32,
-) -> Result<ArrayD<f32>, String> {
+    // _config, model_cache, theta_hat removed as they are not used by model.forward((tensor, None))
+) -> Result<CpuTensor<f32>, String> {
     if prompt_tokens.is_empty() {
         return Err("Prompt tokens cannot be empty for prefill.".to_string());
     }
-    let tokens_array_vec: Vec<i32> = prompt_tokens.iter().map(|&x| x as i32).collect();
-    let input_array = Array2::from_shape_vec((1, tokens_array_vec.len()), tokens_array_vec)
-        .map_err(|e| format!("Failed to create Array2 from prompt_tokens: {}", e))?;
-    model.forward(&input_array, model_cache, theta_hat)
+    let tokens_i32: Vec<i32> = prompt_tokens.iter().map(|&x| x as i32).collect();
+    // Device::CPU is assumed as per previous model refactoring.
+    // The model's forward pass expects shape [batch_size, seq_len]. For REPL, batch_size is 1.
+    let input_tensor = CpuTensor::from_data_and_shape(&tokens_i32, &[1, tokens_i32.len()], Device::CPU)
+        .map_err(|e| format!("Failed to create input CpuTensor for prefill: {}", e))?;
+    
+    // GPT2Model's Module::Input is (CpuTensor<i32>, Option<CpuTensor<f32>>).
+    // Attention mask is None in this REPL context.
+    model.forward((input_tensor, None))
         .map_err(|e| format!("Model forward pass failed during prefill: {}", e))
 }
 
 pub fn generate_next_token(
-    model: &mut GPT2Model,
-    config: &GPT2Config,
+    model: &GPT2Model, // Changed from &mut GPT2Model
     last_token_id: u32,
-    model_cache: &mut ModelKVCache,
-    theta_hat: f32,
-) -> Result<ArrayD<f32>, String> { // Changed return type
-    let token_array = Array2::from_shape_vec((1, 1), vec![last_token_id as i32])
-        .map_err(|e| format!("Failed to create Array2 from last_token_id: {}", e))?;
-    // model.forward is assumed to return raw logits (or hidden_states as placeholder)
-    model.forward(&token_array, model_cache, theta_hat)
+    // config, model_cache, theta_hat removed
+) -> Result<CpuTensor<f32>, String> {
+    let token_i32 = last_token_id as i32;
+    // Shape [batch_size, seq_len], so [1, 1] for generating next token.
+    let input_tensor = CpuTensor::from_data_and_shape(&[token_i32], &[1, 1], Device::CPU)
+        .map_err(|e| format!("Failed to create input CpuTensor for next token: {}", e))?;
+    
+    model.forward((input_tensor, None))
         .map_err(|e| format!("Model forward pass failed during next token generation: {}", e))
 }
 
-// Helper to get a 1D view of the last sequence element's logits
-fn get_last_token_logits_slice(logits: &ArrayD<f32>) -> Option<ArrayView1<f32>> {
-    match logits.ndim() {
-        1 => Some(logits.view().into_dimensionality().unwrap()), // Already 1D
-        3 => { // Assuming [batch, seq_len, vocab_size]
-            if logits.shape()[0] == 0 || logits.shape()[1] == 0 || logits.shape()[2] == 0 {
-                None // Empty dimension
-            } else {
-                Some(logits.slice(s![logits.shape()[0]-1, logits.shape()[1]-1, ..]))
-            }
-        }
-        _ => None, // Unexpected number of dimensions
+// Renamed from get_last_token_logits_slice and updated for CpuTensor
+// Takes CpuTensor<f32> and returns Result<Vec<f32>, String>
+fn get_last_token_logits_vector(logits_tensor: &CpuTensor<f32>) -> Result<Vec<f32>, String> {
+    let shape = logits_tensor.shape();
+    // Expected shape [batch_size, seq_len, vocab_size]. For REPL, batch_size is 1.
+    if shape.len() != 3 {
+        return Err(format!("Unexpected logits tensor rank: {}. Expected 3 (batch, seq, vocab).", shape.len()));
     }
+    if shape[0] == 0 || shape[1] == 0 || shape[2] == 0 {
+        return Err("Logits tensor has an empty dimension.".to_string());
+    }
+
+    // let batch_size = shape[0]; // Expected to be 1 for REPL.
+    let seq_len = shape[1];
+    let vocab_size = shape[2];
+
+    let data_slice = logits_tensor.as_slice()
+        .map_err(|e| format!("Failed to get slice from logits tensor: {}", e))?;
+
+    // Calculate the starting index of the last token's logits in the flat slice.
+    // Data is laid out as [b0_s0_v0, b0_s0_v1, ..., b0_s1_v0, ...].
+    // For batch_size = 1, we want the slice for the last token: (seq_len - 1).
+    let start_index = (seq_len - 1) * vocab_size;
+    let end_index = start_index + vocab_size;
+
+    if end_index > data_slice.len() {
+        return Err(format!(
+            "Calculated logit slice indices [{}, {}) are out of bounds for data length {}. Shape: {:?}.",
+            start_index, end_index, data_slice.len(), shape
+        ));
+    }
+    
+    Ok(data_slice[start_index..end_index].to_vec())
 }
 
-/// Returns the top k tokens and their logit values from a logits array.
-/// Logits are assumed to be for a single token position (e.g., last token in a sequence).
-pub fn get_top_k_tokens(logits: &ArrayD<f32>, k: usize) -> Vec<(u32, f32)> {
-    if k == 0 {
-        return Vec::new();
-    }
-
-    let logits_slice_option = get_last_token_logits_slice(logits);
-    if logits_slice_option.is_none() {
-        return Vec::new();
-    }
-    let logits_slice = logits_slice_option.unwrap();
-
-    if logits_slice.is_empty() {
+/// Returns the top k tokens and their logit values from a slice of logits.
+/// Logits are assumed to be for a single token position.
+pub fn get_top_k_tokens(logits_for_last_token: &[f32], k: usize) -> Vec<(u32, f32)> {
+    if k == 0 || logits_for_last_token.is_empty() { // Check if the provided slice is empty
         return Vec::new();
     }
     
-    let mut indexed_logits: Vec<(u32, f32)> = logits_slice.iter()
+    let mut indexed_logits: Vec<(u32, f32)> = logits_for_last_token.iter()
         .enumerate()
         .map(|(id, &logit_val)| (id as u32, logit_val))
         .collect();
@@ -109,10 +123,10 @@ pub fn get_top_k_tokens(logits: &ArrayD<f32>, k: usize) -> Vec<(u32, f32)> {
 }
 
 
-/// Gets the token ID and logit value for the token with the highest logit score.
-/// Logits are assumed to be for a single token position.
-pub fn get_greedy_token_and_logit(logits: &ArrayD<f32>) -> Result<(u32, f32), String> {
-    let top_k = get_top_k_tokens(logits, 1);
+/// Gets the token ID and logit value for the token with the highest logit score
+/// from a slice of logits for a single token position.
+pub fn get_greedy_token_and_logit(logits_for_last_token: &[f32]) -> Result<(u32, f32), String> {
+    let top_k = get_top_k_tokens(logits_for_last_token, 1); // Now takes a slice
     if let Some(result) = top_k.first() {
         Ok(*result)
     } else {
@@ -132,6 +146,39 @@ pub(crate) fn adjust_theta_hat(initial_theta: f32, user_feedback: &str) -> f32 {
     new_theta.max(0.0).min(1.0)
 }
 
+/// Runs the main Read-Eval-Print Loop (REPL) for interactive token generation.
+///
+/// This loop handles user input, token generation, and user feedback.
+/// It now integrates with an `MoEOrchestrator` to dynamically select experts
+/// based on cache tier policies, system resources, and intentionality score (θ̂).
+///
+/// Key operations within the loop:
+/// 1.  **Dynamic Tier Policy Adjustment**: Before each token generation, the
+///     `MoEOrchestrator`'s `current_allowed_tiers` policy is updated based on
+///     available system RAM and the current `theta_hat` value. This logic is
+///     encapsulated in the `determine_and_set_allowed_tiers` helper function.
+/// 2.  **Token Generation via Orchestrator**: Uses `orchestrator.forward()` to generate
+///     the next token's logits. This call also returns information about which
+///     experts were activated.
+/// 3.  **User Validation**: Prompts the user to validate the generated token ("s"atisfied,
+///     "n"ot satisfied, "q"uit).
+/// 4.  **Theta Hat Adjustment**: Adjusts `theta_hat` based on user feedback.
+/// 5.  **Feedback Storage**: Records the generation experience (prompt context,
+///     generated token, validation, theta_hat) to a JSON file.
+/// 6.  **Information Display**: Shows the generated token, its ID, logit value,
+///     the current `theta_hat`, validation status, and a list of activated experts
+///     (name and cache tier) for the generated token.
+///
+/// # Arguments
+/// * `model`: A mutable reference to the `GPT2Model` (used for embedding lookup via `get_embeddings`).
+/// * `config`: A reference to the `GPT2Config`.
+/// * `tokenizer`: A reference to the `TokenizerWrapper` for encoding/decoding tokens.
+/// * `initial_prompt_tokens`: A vector of token IDs for the initial prompt.
+/// * `max_new_tokens`: The maximum number of new tokens to generate in this session.
+/// * `initial_theta_hat`: The starting value for the intentionality score.
+/// * `eos_token_id`: The end-of-sequence token ID to stop generation.
+/// * `store`: A mutable reference to the `ResonanceFeedbackStore` for saving experiences.
+/// * `orchestrator`: A mutable reference to the `MoEOrchestrator` to be used for expert selection and generation.
 #[allow(clippy::too_many_arguments)] 
 pub fn run_repl_loop(
     model: &mut GPT2Model,
@@ -146,20 +193,24 @@ pub fn run_repl_loop(
     if initial_prompt_tokens.is_empty() {
         return Err("Initial prompt tokens cannot be empty for REPL loop.".to_string());
     }
-    let mut model_cache: ModelKVCache = vec![Vec::new(); config.n_layer as usize];
+    // ModelKVCache is not used in the current generation flow with model.forward((tensor, None)).
+    // Commenting out its initialization.
+    // let mut model_cache: ModelKVCache = vec![Vec::new(); config.n_layer as usize];
     let mut current_token_ids = initial_prompt_tokens.clone();
-    let mut current_theta_hat = initial_theta_hat;
+    let mut current_theta_hat = initial_theta_hat; // Used for adjust_theta_hat and logging
 
     println!("> prompt: (tokens) {:?}", initial_prompt_tokens);
     
-    let prefill_output_array = prefill_prompt(
-        model, config, &current_token_ids, &mut model_cache, current_theta_hat
+    let prefill_output_tensor = prefill_prompt(
+        model, &current_token_ids
     )?;
 
-    // Use the new get_greedy_token_and_logit function
-    // Process prefill output to get the first generated token
-    let (first_generated_token_id, first_dominant_logit) = get_greedy_token_and_logit(&prefill_output_array)?;
-    let first_top_k_alternatives = get_top_k_tokens(&prefill_output_array, 4); // Get top 4 for up to 3 alternatives
+    // Process CpuTensor output
+    let prefill_logits_vec = get_last_token_logits_vector(&prefill_output_tensor)
+        .map_err(|e| format!("Failed to get logits from prefill output: {}", e))?;
+    
+    let (first_generated_token_id, first_dominant_logit) = get_greedy_token_and_logit(&prefill_logits_vec)?;
+    let first_top_k_alternatives = get_top_k_tokens(&prefill_logits_vec, 4);
     
     let mut next_token_id = first_generated_token_id;
     current_token_ids.push(next_token_id);
@@ -265,13 +316,17 @@ pub fn run_repl_loop(
             let last_token_id_for_gen = token_display_id; // The token we just processed
             
             // Generate logits for the *next* token
-            let next_logits = generate_next_token(
-                model, config, last_token_id_for_gen, &mut model_cache, current_theta_hat
+            // Updated call to generate_next_token (model is &GPT2Model, no config, cache, theta_hat)
+            let next_logits_tensor = generate_next_token(
+                model, last_token_id_for_gen
             )?;
             
-            // Determine the next token and its logit info based on these new logits
-            let (chosen_next_token_id, next_dominant_logit) = get_greedy_token_and_logit(&next_logits)?;
-            let next_top_k_alternatives = get_top_k_tokens(&next_logits, 4);
+            // Process CpuTensor output
+            let next_logits_vec = get_last_token_logits_vector(&next_logits_tensor)
+                 .map_err(|e| format!("Failed to get logits from next token output: {}", e))?;
+
+            let (chosen_next_token_id, next_dominant_logit) = get_greedy_token_and_logit(&next_logits_vec)?;
+            let next_top_k_alternatives = get_top_k_tokens(&next_logits_vec, 4);
 
             next_token_id = chosen_next_token_id;
             current_token_ids.push(next_token_id);
@@ -290,7 +345,21 @@ pub fn run_repl_loop(
     Ok(())
 }
 
-// Main function for standalone REPL execution
+/// Main entry point for the standalone REPL application.
+///
+/// This function orchestrates the setup of all necessary components for the REPL session:
+/// 1.  Initializes `GPT2Config` and `GPT2Model`.
+/// 2.  Initializes the `TokenizerWrapper`.
+/// 3.  Initializes the `MoEOrchestrator` with a predefined set of experts (e.g., `SymbolicExpert`, `MLPExpert`)
+///     and a `GatingLayer`. This orchestrator will manage expert activation during token generation.
+/// 4.  Retrieves the user's initial prompt and tokenizes it.
+/// 5.  Initializes the `ResonanceFeedbackStore` for recording user feedback.
+/// 6.  Predicts or sets an initial `theta_hat` (intentionality score).
+/// 7.  Calls `run_repl_loop` to start the interactive session, passing all initialized components,
+///     including the `orchestrator`.
+///
+/// # Returns
+/// `Ok(())` on successful execution, or a `Box<dyn Error>` if any critical setup or runtime error occurs.
 pub fn main() -> Result<(), Box<dyn Error>> {
     println!("--- Standalone REPL Initializing ---");
 
@@ -302,6 +371,12 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let mut model = GPT2Model::new(&config)
         .map_err(|e| format!("Failed to create GPT2Model: {}", e))?;
     println!("GPT2Model initialized.");
+
+    // Initialize Accelerator and prepare the model
+    let accelerator = Accelerator::new(Device::CPU); // Assuming CPU for REPL
+    accelerator.prepare(&mut model)
+        .map_err(|e| format!("Failed to prepare model with accelerator: {}", e))?;
+    println!("GPT2Model prepared with Accelerator on {:?}.", accelerator.current_device());
 
     // 3. Initialize TokenizerWrapper
     // Using test_tokenizer.json as it's known to exist and be compatible.
@@ -401,149 +476,123 @@ mod tests {
     #[cfg(test)]
     mod repl_logic_tests {
         use super::*;
-        use crate::model::{GPT2Model, GPT2Config};
-        use crate::common::ModelKVCache;
+        // GPT2Model, GPT2Config, Accelerator, Device, Module, CpuTensor, Tensor are in outer scope.
+        // ModelKVCache might be needed if tests involve functions that still use it (not currently).
+        // Removed ndarray imports as they are no longer needed for the updated tests.
+        // use ndarray::{ArrayD, IxDyn};
 
-        fn create_test_config() -> GPT2Config {
+        fn create_test_config_for_repl() -> GPT2Config { 
             GPT2Config {
-                vocab_size: 50257, n_layer: 2, n_head: 2, n_embd: 128,
-                n_positions: 1024, n_ctx: 1024, block_size: 1024,
-                embd_pdrop: 0.1, resid_pdrop: 0.1, attn_pdrop: 0.1,
+                vocab_size: 50, n_layer: 1, n_head: 1, n_embd: 4, // Minimal for testing
+                n_positions: 64, n_ctx: 64, block_size: 64, // Smaller context
+                embd_pdrop: 0.0, resid_pdrop: 0.0, attn_pdrop: 0.0,
                 layer_norm_epsilon: 1e-5, initializer_range: 0.02,
-                n_inner: None, activation_function: "gelu_new".to_string(),
-                bos_token_id: Some(50256), eos_token_id: Some(50256),
+                n_inner: Some(8), activation_function: "gelu_new".to_string(),
+                bos_token_id: Some(50256), eos_token_id: Some(50256), 
                 scale_attn_weights: true, scale_attn_by_inverse_layer_idx: false,
                 reorder_and_upcast_attn: false,
             }
         }
+        
+        fn initialized_test_model() -> (GPT2Model, GPT2Config) {
+            let config = create_test_config_for_repl();
+            let mut model = GPT2Model::new(&config).expect("Failed to create test model.");
+            let accelerator = Accelerator::new(Device::CPU);
+            accelerator.prepare(&mut model).expect("Failed to prepare model with accelerator.");
+            (model, config)
+        }
 
         #[test]
-        fn test_prefill_prompt_basic() {
-            let config = create_test_config();
-            let mut model = GPT2Model::new(&config).expect("Failed to create test model.");
-            let mut cache: ModelKVCache = vec![Vec::new(); config.n_layer as usize];
+        fn test_prefill_prompt_basic() { 
+            let (model, config) = initialized_test_model();
             let prompt_tokens: Vec<u32> = vec![0, 1, 2];
-            let theta = 0.0f32;
-            let result = prefill_prompt(&mut model, &config, &prompt_tokens, &mut cache, theta);
+            
+            let result = prefill_prompt(&model, &prompt_tokens);
             assert!(result.is_ok());
-            let output_array = result.unwrap();
-            let expected_shape: Vec<usize> = vec![1, prompt_tokens.len(), config.n_embd as usize];
-            assert_eq!(output_array.shape(), expected_shape.as_slice());
+            let output_tensor = result.unwrap();
+            // Output of GPT2Model::forward is hidden states, shape [batch, seq, n_embd]
+            // For REPL, batch is 1.
+            let expected_shape: &[usize] = &[1, prompt_tokens.len(), config.n_embd as usize];
+            assert_eq!(output_tensor.shape(), expected_shape);
         }
 
         #[test]
-        fn test_prefill_prompt_empty_tokens() {
-            let config = create_test_config();
-            let mut model = GPT2Model::new(&config).expect("Failed to create test model.");
-            let mut cache: ModelKVCache = vec![Vec::new(); config.n_layer as usize];
+        fn test_prefill_prompt_empty_tokens() { 
+            let (model, _config) = initialized_test_model();
             let prompt_tokens: Vec<u32> = vec![];
-            let theta = 0.0f32;
-            let result = prefill_prompt(&mut model, &config, &prompt_tokens, &mut cache, theta);
-            assert!(result.is_err());
+            let result = prefill_prompt(&model, &prompt_tokens);
+            assert!(result.is_err()); 
         }
 
         #[test]
-        fn test_generate_next_token_basic() {
-            let config = create_test_config();
-            let mut model = GPT2Model::new(&config).expect("Failed to create test model.");
-            let mut cache: ModelKVCache = vec![Vec::new(); config.n_layer as usize];
+        fn test_generate_next_token_basic() { 
+            let (model, config) = initialized_test_model();
             let last_token_id: u32 = 0;
-            let theta = 0.0f32;
-            let result = generate_next_token(&mut model, &config, last_token_id, &mut cache, theta);
+            
+            let result = generate_next_token(&model, last_token_id);
             assert!(result.is_ok());
-            let (next_token, output_array) = result.unwrap();
-            assert_eq!(next_token, 0);
-            let expected_shape: Vec<usize> = vec![1, 1, config.n_embd as usize];
-            assert_eq!(output_array.shape(), expected_shape.as_slice());
+            let output_tensor = result.unwrap();
+            // Output of GPT2Model::forward is hidden states, shape [batch, seq, n_embd]
+            // For REPL, batch is 1, seq is 1.
+            let expected_shape: &[usize] = &[1, 1, config.n_embd as usize];
+            assert_eq!(output_tensor.shape(), expected_shape);
         }
         
         #[test]
-        fn test_get_greedy_token_and_logit_basic() {
-            // Test with 1D array
-            let logits_1d = ArrayD::from_shape_vec(IxDyn(&[5]), vec![0.1, 0.2, 0.5, 0.1, 0.1]).unwrap();
-            let (token_id, logit_val) = get_greedy_token_and_logit(&logits_1d).unwrap();
+        fn test_get_last_token_logits_vector_valid() { 
+            let vocab_size = 5;
+            let data = (0..(1 * 2 * vocab_size)).map(|x| x as f32).collect::<Vec<f32>>();
+            let tensor = CpuTensor::from_data_and_shape(&data, &[1, 2, vocab_size], Device::CPU).unwrap();
+            let logits_vec = get_last_token_logits_vector(&tensor).unwrap();
+            let expected_logits = data[vocab_size..].to_vec(); 
+            assert_eq!(logits_vec, expected_logits);
+
+            let data_seq1 = (0..vocab_size).map(|x| x as f32).collect::<Vec<f32>>();
+            let tensor_seq1 = CpuTensor::from_data_and_shape(&data_seq1, &[1, 1, vocab_size], Device::CPU).unwrap();
+            let logits_vec_seq1 = get_last_token_logits_vector(&tensor_seq1).unwrap();
+            assert_eq!(logits_vec_seq1, data_seq1);
+        }
+
+        #[test]
+        fn test_get_greedy_token_and_logit_basic() { 
+            let logits_slice = vec![0.1, 0.2, 0.5, 0.1, 0.1];
+            let (token_id, logit_val) = get_greedy_token_and_logit(&logits_slice).unwrap();
             assert_eq!(token_id, 2);
             assert!((logit_val - 0.5).abs() < f32::EPSILON);
-
-            // Test with 3D array (e.g., model output [1,1,V])
-            let logits_3d = ArrayD::from_shape_vec(IxDyn(&[1, 1, 5]), vec![0.1, 0.8, 0.5, 0.1, 0.1]).unwrap();
-            let (token_id_3d, logit_val_3d) = get_greedy_token_and_logit(&logits_3d).unwrap();
-            assert_eq!(token_id_3d, 1);
-            assert!((logit_val_3d - 0.8).abs() < f32::EPSILON);
-
-            // Test with another 3D array, last element in seq
-             let logits_3d_long_seq = ArrayD::from_shape_vec(IxDyn(&[1, 3, 5]), 
-                vec![0.1, 0.2, 0.3, 0.4, 0.0, // seq 0
-                     0.0, 0.0, 0.0, 0.0, 0.0, // seq 1
-                     0.1, 0.8, 0.5, 0.1, 0.1  // seq 2 (last one)
-                    ]).unwrap();
-            let (token_id_3d_ls, logit_val_3d_ls) = get_greedy_token_and_logit(&logits_3d_long_seq).unwrap();
-            assert_eq!(token_id_3d_ls, 1); // from last sequence element
-            assert!((logit_val_3d_ls - 0.8).abs() < f32::EPSILON);
         }
 
         #[test]
-        fn test_get_greedy_token_and_logit_empty_or_invalid() {
-            let empty_logits_1d = ArrayD::from_shape_vec(IxDyn(&[0]), vec![]).unwrap();
-            assert!(get_greedy_token_and_logit(&empty_logits_1d).is_err());
-            
-            let empty_logits_3d = ArrayD::from_shape_vec(IxDyn(&[1,1,0]), vec![]).unwrap();
-            assert!(get_greedy_token_and_logit(&empty_logits_3d).is_err());
-
-            let invalid_shape_logits = ArrayD::zeros(IxDyn(&[1,1,1,1])); // 4D
-             assert!(get_greedy_token_and_logit(&invalid_shape_logits).is_err());
+        fn test_get_greedy_token_and_logit_empty() { 
+            let empty_logits_slice: Vec<f32> = vec![];
+            assert!(get_greedy_token_and_logit(&empty_logits_slice).is_err());
         }
 
         #[test]
-        fn test_get_top_k_tokens_basic() {
-            let logits_1d = ArrayD::from_shape_vec(IxDyn(&[5]), vec![0.1, 0.7, 0.5, 0.9, 0.3]).unwrap();
-            // Expected sorted: (3, 0.9), (1, 0.7), (2, 0.5), (4, 0.3), (0, 0.1)
+        fn test_get_top_k_tokens_basic() { 
+            let logits_slice = vec![0.1, 0.7, 0.5, 0.9, 0.3];
             
-            let top_1 = get_top_k_tokens(&logits_1d, 1);
+            let top_1 = get_top_k_tokens(&logits_slice, 1);
             assert_eq!(top_1.len(), 1);
-            assert_eq!(top_1[0].0, 3); // token id
-            assert!((top_1[0].1 - 0.9).abs() < f32::EPSILON); // logit value
+            assert_eq!(top_1[0].0, 3);
+            assert!((top_1[0].1 - 0.9).abs() < f32::EPSILON);
 
-            let top_3 = get_top_k_tokens(&logits_1d, 3);
+            let top_3 = get_top_k_tokens(&logits_slice, 3);
             assert_eq!(top_3.len(), 3);
             assert_eq!(top_3[0].0, 3);
             assert_eq!(top_3[1].0, 1);
             assert_eq!(top_3[2].0, 2);
-            assert!((top_3[0].1 - 0.9).abs() < f32::EPSILON);
-            assert!((top_3[1].1 - 0.7).abs() < f32::EPSILON);
-            assert!((top_3[2].1 - 0.5).abs() < f32::EPSILON);
 
-            // K larger than vocab size
-            let top_10 = get_top_k_tokens(&logits_1d, 10);
-            assert_eq!(top_10.len(), 5); // Should return all available, sorted
-            assert_eq!(top_10[0].0, 3);
-            assert_eq!(top_10[4].0, 0);
+            let top_10 = get_top_k_tokens(&logits_slice, 10); 
+            assert_eq!(top_10.len(), 5); 
 
-            // K = 0
-            let top_0 = get_top_k_tokens(&logits_1d, 0);
+            let top_0 = get_top_k_tokens(&logits_slice, 0); 
             assert!(top_0.is_empty());
         }
 
         #[test]
-        fn test_get_top_k_tokens_3d() {
-            let logits_3d = ArrayD::from_shape_vec(IxDyn(&[1, 1, 5]), vec![0.1, 0.7, 0.5, 0.9, 0.3]).unwrap();
-            // Expected sorted: (3, 0.9), (1, 0.7), (2, 0.5), (4, 0.3), (0, 0.1)
-            let top_2 = get_top_k_tokens(&logits_3d, 2);
-            assert_eq!(top_2.len(), 2);
-            assert_eq!(top_2[0].0, 3);
-            assert_eq!(top_2[1].0, 1);
-        }
-
-        #[test]
-        fn test_get_top_k_tokens_empty_or_invalid() {
-            let empty_logits_1d = ArrayD::from_shape_vec(IxDyn(&[0]), vec![]).unwrap();
-            assert!(get_top_k_tokens(&empty_logits_1d, 3).is_empty());
-
-            let empty_logits_3d = ArrayD::from_shape_vec(IxDyn(&[1,1,0]), vec![]).unwrap();
-            assert!(get_top_k_tokens(&empty_logits_3d, 3).is_empty());
-            
-            let invalid_shape_logits = ArrayD::zeros(IxDyn(&[2,2])); // 2D
-            assert!(get_top_k_tokens(&invalid_shape_logits, 3).is_empty());
+        fn test_get_top_k_tokens_empty() { 
+            let empty_logits_slice: Vec<f32> = vec![];
+            assert!(get_top_k_tokens(&empty_logits_slice, 3).is_empty());
         }
 
 
