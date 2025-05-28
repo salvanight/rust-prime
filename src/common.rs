@@ -20,6 +20,7 @@ impl LayerNorm {
     }
 
     pub fn forward(&self, x: &ArrayD<f32>) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
+feat/gpt2-core-logic-and-weights
         let last_dim_idx = x.ndim() - 1;
         let axis = Axis(last_dim_idx);
 
@@ -129,5 +130,15 @@ mod tests {
         assert!(ln._weight.iter().all(|&x| (x - 1.0).abs() < f32::EPSILON));
         assert!(ln._bias.iter().all(|&x| (x - 0.0).abs() < f32::EPSILON));
         Ok(())
+=======
+        // Placeholder for LayerNorm forward pass
+        // Actual implementation would normalize x using self.weight and self.bias
+        // println!("LayerNorm forward called with tensor of shape: {:?}", x.shape());
+        // For now, just return a clone for shape testing.
+        Ok(x.clone()) // Simplest placeholder
+        // todo!("Implement LayerNorm forward pass");
+ main
     }
 }
+
+pub type ModelKVCache = Vec<Vec<f32>>;

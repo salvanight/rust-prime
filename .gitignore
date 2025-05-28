@@ -1,3 +1,4 @@
+feat/gpt2-core-logic-and-weights
 # Rust build artifacts
 target/
 Cargo.lock
@@ -7,5 +8,18 @@ Cargo.lock
 .idea/
 
 # OS specific
+=======
+# Rust target directory
+target/
+
+# IDE settings
+.idea/
+.vscode/
+
+# Cargo lock file (usually committed, but can be ignored in some contexts)
+# Cargo.lock
+
+# OS generated files
+main
 .DS_Store
 Thumbs.db
