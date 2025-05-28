@@ -303,6 +303,56 @@ mod tests {
         let model = create_dummy_model_for_generation(vocab_size, block_size, n_embd);
         let input_ids: Vec<u32> = vec![];
         let result = generate(&model, input_ids, 5, 0, None);
+        feature/tensor-performance-upgrade
+=======
+        assert!(matches!(result, Err(TextGeneratorError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_generate_max_length_zero() {
+        let vocab_size = 10;
+        let block_size = 5;
+        let n_embd = 4;
+        let model = create_dummy_model_for_generation(vocab_size, block_size, n_embd);
+        let input_ids = vec![1u32];
+        let max_len = 0;
+        let eos_id = 99;
+
+        let result = generate(&model, input_ids, max_len, eos_id, None);
+        assert!(matches!(result, Err(TextGeneratorError::InvalidInput(msg)) if msg.contains("Max length must be greater than 0")));
+    }
+
+    #[test]
+    fn test_generate_max_length_one_from_prompt_of_one() {
+        let vocab_size = 10;
+        let block_size = 5;
+        let n_embd = 4;
+        let model = create_dummy_model_for_generation(vocab_size, block_size, n_embd);
+        
+        let input_ids = vec![1u32]; // Prompt of length 1
+        let max_len = 1; // Max length is same as prompt length
+        let eos_id = 99;
+
+        let result = generate(&model, input_ids.clone(), max_len, eos_id, None);
+        assert!(result.is_ok(), "Generation failed: {:?}", result.err());
+        let generated_sequence = result.unwrap();
+        // Expect only the input_ids back, as no new tokens should be generated.
+        assert_eq!(generated_sequence, input_ids, "Should return prompt if max_length is same as prompt length");
+        assert_eq!(generated_sequence.len(), 1);
+    }
+
+    #[test]
+    fn test_generate_max_length_one_from_empty_prompt_is_error() {
+        // This case is already covered by test_generate_empty_input_error
+        // generate() returns Err if input_ids is empty.
+        let vocab_size = 10;
+        let block_size = 5;
+        let n_embd = 4;
+        let model = create_dummy_model_for_generation(vocab_size, block_size, n_embd);
+        let input_ids: Vec<u32> = vec![];
+        let max_len = 1;
+        let eos_id = 99;
+        let result = generate(&model, input_ids, max_len, eos_id, None);
         assert!(matches!(result, Err(TextGeneratorError::InvalidInput(_))));
     }
 }
