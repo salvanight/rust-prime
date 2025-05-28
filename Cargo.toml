@@ -7,6 +7,16 @@ edition = "2021"
 
 [dependencies]
 tokenizers = "0.15.0"
+feat/gpt2-core-logic-and-weights
+ndarray = "0.15.6"
+serde = { version = "1.0.190", features = ["derive"] }
+serde_json = "1.0.108"
+safetensors = "0.4.0"
+clap = { version = "4.4.8", features = ["derive"] }
+
+[dev-dependencies]
+approx = "0.5"
+=======
 ndarray = { version = "0.15.6", optional = true }
 serde = { version = "1.0.190", features = ["derive"] }
 serde_json = "1.0.108"
@@ -36,3 +46,4 @@ required-features = ["ndarray_backend"]
 [dev-dependencies]
 tempfile = "3.3.0"
 proptest = "1.0"
+main
