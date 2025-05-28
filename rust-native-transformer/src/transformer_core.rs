@@ -398,8 +398,8 @@ impl MultiHeadAttention {
         let v_heads_current = v_all_current_input.reshape(vec![batch_size, current_seq_len, n_head, head_dim])?
                                      .permute_mha_qkv()?;
 
-        let mut k_for_attention_all_heads: Tensor<f32>;
-        let mut v_for_attention_all_heads: Tensor<f32>;
+        let k_for_attention_all_heads: Tensor<f32>; // Removed mut
+        let v_for_attention_all_heads: Tensor<f32>; // Removed mut
         let mut effective_kv_seq_len = current_seq_len; 
 
         if let Some(layer_cache_mut) = cache {
@@ -455,7 +455,8 @@ impl MultiHeadAttention {
         for b_idx in 0..batch_size {
             for h_idx in 0..n_head {
                 let q_slice = q_heads.slice_mha(b_idx, h_idx)?; 
-                let k_t_slice = k_t_final.slice_mha_for_kv(b_idx, h_idx, effective_kv_seq_len)?; 
+                // k_t_final has shape [B, H, Dk, Skv]. slice_mha will extract [Dk, Skv].
+                let k_t_slice = k_t_final.slice_mha(b_idx, h_idx)?; 
                 
                 let mut scores_s = Tensor::matmul(&q_slice, &k_t_slice)?; 
                 for val in scores_s.data.iter_mut() {
@@ -731,11 +732,54 @@ impl GPT2Model {
         };
         let pos_ids_tensor = Tensor::new(pos_ids_tensor_data, pos_ids_tensor_shape)?;
         
-        let pos_embed_full = tensor_ops::embedding(&pos_ids_tensor, &self.wpe)?; 
+        let mut pos_embed_reshaped = tensor_ops::embedding(&pos_ids_tensor, &self.wpe)?;
 
-        // If pos_embed_full is [S_q, E] and token_embed is [B, S_q, E], we need to broadcast/add.
-        // If pos_embed_full is [B, S_q, E] (due to batch_size in pos_ids_tensor_shape), direct add is fine.
-        let mut x = tensor_ops::add(&token_embed, &pos_embed_full)?;
+        // token_embed shape: [B, S, E]
+        // pos_embed_reshaped initial shape from embedding: [S, E] (if batch_size=1 for pos_ids) or [B,S,E]
+        // We need to ensure pos_embed_reshaped becomes [1, S, E] if it's [S,E] to allow broadcasting with [B,S,E]
+        if pos_embed_reshaped.rank() == 2 && token_embed.rank() == 3 {
+            // Check if dimensions match for broadcasting: S_pos == S_token, E_pos == E_token
+            if pos_embed_reshaped.shape[0] == token_embed.shape[1] && pos_embed_reshaped.shape[1] == token_embed.shape[2] {
+                let new_shape_for_pos = vec![1, pos_embed_reshaped.shape[0], pos_embed_reshaped.shape[1]];
+                pos_embed_reshaped = pos_embed_reshaped.reshape(new_shape_for_pos)?;
+            } else {
+                return Err(TransformerError::TensorError(TensorError::IncompatibleShapes(
+                    format!("Positional embedding shape {:?} not broadcastable to token embedding shape {:?} after attempting reshape to 3D", 
+                            pos_embed_reshaped.shape, token_embed.shape)
+                )));
+            }
+        }
+        
+        // Now, token_embed is [B,S,E] and pos_embed_reshaped should be [1,S,E] or [B,S,E].
+        // Ndarray's `+` operator should handle broadcasting [1,S,E] to [B,S,E].
+        // If tensor_ops::add is more robust or handles specific errors, use it.
+        // For now, let's assume direct addition works if shapes are compatible for broadcasting.
+        // The previous custom tensor_ops::add was more for 1D bias.
+        // Direct ndarray add:
+        let mut x_data = token_embed.data.clone();
+        if token_embed.shape == pos_embed_reshaped.shape {
+            for (val_x, val_pos) in x_data.iter_mut().zip(pos_embed_reshaped.data.iter()) {
+                *val_x += val_pos;
+            }
+        } else if pos_embed_reshaped.shape[0] == 1 && // Standard broadcasting case: [B,S,E] + [1,S,E]
+                   pos_embed_reshaped.shape[1] == token_embed.shape[1] &&
+                   pos_embed_reshaped.shape[2] == token_embed.shape[2] {
+            let s = token_embed.shape[1];
+            let e = token_embed.shape[2];
+            for b_idx in 0..token_embed.shape[0] {
+                for s_idx in 0..s {
+                    for e_idx in 0..e {
+                        x_data[b_idx*s*e + s_idx*e + e_idx] += pos_embed_reshaped.data[s_idx*e + e_idx];
+                    }
+                }
+            }
+        } else {
+             return Err(TransformerError::TensorError(TensorError::IncompatibleShapes(
+                format!("Cannot add token_embed {:?} and pos_embed_reshaped {:?}: shapes not directly addable or broadcastable in this specific manner", 
+                        token_embed.shape, pos_embed_reshaped.shape)
+            )));
+        }
+        let mut x = Tensor::new(x_data, token_embed.shape.clone())?;
 
 
         // Mask generation:
