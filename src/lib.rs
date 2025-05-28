@@ -7,8 +7,10 @@ use std::io::Read; // For load_pre_tokenized_from_json
 // This is the main library file.
 // We will add functions and structures here later.
 
+pub mod native;
 pub mod config;
 pub mod common;
+pub mod accelerator;
 pub mod attention;
 pub mod mlp;
 pub mod model;
