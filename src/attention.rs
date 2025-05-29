@@ -1,6 +1,7 @@
-use ndarray::{Array, ArrayD, Axis, Ix1, Ix2, Ix4, Slice, ShapeError, s}; // Removed Zip, Div
+use ndarray::{Array, ArrayD, Axis, Ix1, Ix2, Ix3, Ix4, Slice, ShapeError, s, concatenate}; // Removed Zip, Div // Added Ix3, concatenate
 use std::error::Error;
-// Removed: use std::ops::Div; 
+// Removed: use std::ops::Div;
+use crate::common::{KVCacheEntry, LayerKVCache};
 
 // Helper function for softmax
 fn softmax(input: &ArrayD<f32>, axis_index: usize) -> Result<ArrayD<f32>, Box<dyn Error>> {
@@ -84,10 +85,10 @@ main
     }
 
     pub fn forward(
-feat/gpt2-core-logic-and-weights
         &self,
         hidden_states: &ArrayD<f32>,
-        _attention_mask: Option<&ArrayD<f32>>, // Placeholder for attention mask
+        attention_mask: Option<&ArrayD<f32>>,
+        layer_kv_cache: Option<&mut LayerKVCache>,
     ) -> Result<ArrayD<f32>, Box<dyn Error>> {
         let initial_shape = hidden_states.shape();
         if initial_shape.len() != 3 {
@@ -98,111 +99,203 @@ feat/gpt2-core-logic-and-weights
             .into());
         }
         let batch_size = initial_shape[0];
-        let seq_len = initial_shape[1];
-        // let current_n_embd = initial_shape[2]; // Should match self.n_embd
+        let seq_len_q = initial_shape[1]; // Sequence length of Query
 
-        // Reshape hidden_states for matrix multiplication: [B, S, E] -> [B*S, E]
+        // Reshape hidden_states for matrix multiplication: [B, S_q, E] -> [B*S_q, E]
         let hidden_states_reshaped_view = hidden_states
             .view()
-            .into_shape((batch_size * seq_len, self.n_embd as usize))
-            .map_err(|e: ShapeError| e.to_string())?; // Convert ShapeError to String error
+            .into_shape((batch_size * seq_len_q, self.n_embd as usize))
+            .map_err(|e: ShapeError| e.to_string())?;
 
-        // QKV Projection: (B*S, E) @ (E, 3E) -> (B*S, 3E)
-        // c_attn_w is ArrayD, needs to be viewed as Ix2 for dot product
+        // QKV Projection: (B*S_q, E) @ (E, 3E) -> (B*S_q, 3E)
         let c_attn_w_view = self.c_attn_w.view().into_dimensionality::<Ix2>()
             .map_err(|e| format!("Failed to view c_attn_w as Ix2: {}", e))?;
         let qkv_projected = hidden_states_reshaped_view.dot(&c_attn_w_view);
 
-        // Add bias: (B*S, 3E) + (3E) -> (B*S, 3E)
-        // c_attn_b is ArrayD, needs to be viewed as Ix1 for broadcasting
+        // Add bias: (B*S_q, 3E) + (3E) -> (B*S_q, 3E)
         let c_attn_b_view = self.c_attn_b.view().into_dimensionality::<Ix1>()
             .map_err(|e| format!("Failed to view c_attn_b as Ix1: {}", e))?;
-        let qkv_biased = qkv_projected + &c_attn_b_view; // qkv_projected is owned Array<_, Ix2>
+        let qkv_biased = qkv_projected + &c_attn_b_view;
 
-        // Reshape back to [B, S, 3E]
+        // Reshape back to [B, S_q, 3E]
         let qkv = qkv_biased
-            .into_shape((batch_size, seq_len, 3 * self.n_embd as usize))
-            .map_err(|e: ShapeError| e.to_string())? // Convert ShapeError to String error
-            .into_dyn(); // Convert Array<_, Ix3> to ArrayD<_>
+            .into_shape((batch_size, seq_len_q, 3 * self.n_embd as usize))
+            .map_err(|e: ShapeError| e.to_string())?
+            .into_dyn();
 
-        // Split Q, K, V
-        // Each will have shape [B, S, E]
-        let q = qkv.slice_axis(Axis(2), Slice::from(0..(self.n_embd as usize))).to_owned();
-        let k = qkv.slice_axis(Axis(2), Slice::from((self.n_embd as usize)..(2 * self.n_embd as usize))).to_owned();
-        let v = qkv.slice_axis(Axis(2), Slice::from((2 * self.n_embd as usize)..(3 * self.n_embd as usize))).to_owned();
+        // Split Q, K, V (current)
+        // Each will have shape [B, S_q, E]
+        let q_current = qkv.slice_axis(Axis(2), Slice::from(0..(self.n_embd as usize))).to_owned();
+        let k_current = qkv.slice_axis(Axis(2), Slice::from((self.n_embd as usize)..(2 * self.n_embd as usize))).to_owned();
+        let v_current = qkv.slice_axis(Axis(2), Slice::from((2 * self.n_embd as usize)..(3 * self.n_embd as usize))).to_owned();
 
-        // Reshape and transpose Q, K, V for multi-head attention
-        // Q: [B, S, E] -> [B, S, n_head, head_dim] -> [B, n_head, S, head_dim]
-        // Reshape and transpose Q, K, V for multi-head attention
-        // Q: [B, S, E] -> [B, S, n_head, head_dim] -> [B, n_head, S, head_dim]
-        let q_split = q
-            .into_shape((batch_size, seq_len, self.n_head as usize, self.head_dim as usize))
+        // Reshape Q for multi-head attention
+        // Q: [B, S_q, E] -> [B, S_q, n_head, head_dim] -> [B, n_head, S_q, head_dim]
+        let q_split = q_current
+            .into_shape((batch_size, seq_len_q, self.n_head as usize, self.head_dim as usize))
             .map_err(|e: ShapeError| format!("Error reshaping Q: {}", e.to_string()))?
-            .permuted_axes([0, 2, 1, 3]); // Shape: [B, H, S, Dh]
+            .permuted_axes([0, 2, 1, 3]); // Shape: [B, H, S_q, Dh]
 
-        let k_split = k
-            .into_shape((batch_size, seq_len, self.n_head as usize, self.head_dim as usize))
-            .map_err(|e: ShapeError| format!("Error reshaping K: {}", e.to_string()))?
-            .permuted_axes([0, 2, 1, 3]); // Shape: [B, H, S, Dh]
+        let (k_split, v_split, seq_len_kv) = if let Some(cache) = layer_kv_cache {
+            // KV Caching is active
+            let mut k_head_list = Vec::with_capacity(self.n_head as usize);
+            let mut v_head_list = Vec::with_capacity(self.n_head as usize);
+            let mut current_max_kv_len = 0;
 
-        let v_split = v
-            .into_shape((batch_size, seq_len, self.n_head as usize, self.head_dim as usize))
-            .map_err(|e: ShapeError| format!("Error reshaping V: {}", e.to_string()))?
-            .permuted_axes([0, 2, 1, 3]); // Shape: [B, H, S, Dh]
+            for h in 0..(self.n_head as usize) {
+                // k_current_h_unpermuted: [B, S_q, Dh]
+                let k_current_h_unpermuted = k_current.view()
+                    .into_shape((batch_size, seq_len_q, self.n_head as usize, self.head_dim as usize)).map_err(|e: ShapeError| e.to_string())?
+                    .slice_axis(Axis(2), Slice::from(h..(h+1))) // Still [B, S_q, 1, Dh]
+                    .into_shape((batch_size, seq_len_q, self.head_dim as usize)).map_err(|e: ShapeError| e.to_string())?
+                    .to_owned(); // Shape: [B, S_q, Dh]
+
+                // v_current_h_unpermuted: [B, S_q, Dh]
+                 let v_current_h_unpermuted = v_current.view()
+                    .into_shape((batch_size, seq_len_q, self.n_head as usize, self.head_dim as usize)).map_err(|e: ShapeError| e.to_string())?
+                    .slice_axis(Axis(2), Slice::from(h..(h+1))) // Still [B, S_q, 1, Dh]
+                    .into_shape((batch_size, seq_len_q, self.head_dim as usize)).map_err(|e: ShapeError| e.to_string())?
+                    .to_owned(); // Shape: [B, S_q, Dh]
+
+                let (k_h_combined, v_h_combined) = {
+                    let cache_entry = &mut cache[h]; // KVCacheEntry for head h
+                    let k_past_h = &cache_entry.key; // ArrayD<f32> [B, S_kv_past, Dh]
+                    let v_past_h = &cache_entry.value; // ArrayD<f32> [B, S_kv_past, Dh]
+
+                    let k_combined_h_specific: ArrayD<f32>;
+                    let v_combined_h_specific: ArrayD<f32>;
+
+                    if k_past_h.shape()[1] == 0 { // Empty cache for this head
+                        k_combined_h_specific = k_current_h_unpermuted.into_dyn();
+                        v_combined_h_specific = v_current_h_unpermuted.into_dyn();
+                    } else {
+                        // Ensure past and current are 3D for concatenation
+                        let k_past_h_view = k_past_h.view().into_dimensionality::<Ix3>()
+                            .map_err(|e| format!("Error viewing k_past_h as Ix3: {}", e))?;
+                        let v_past_h_view = v_past_h.view().into_dimensionality::<Ix3>()
+                            .map_err(|e| format!("Error viewing v_past_h as Ix3: {}", e))?;
+                        
+                        let k_current_h_view = k_current_h_unpermuted.view().into_dimensionality::<Ix3>()
+                             .map_err(|e| format!("Error viewing k_current_h as Ix3: {}", e))?;
+                        let v_current_h_view = v_current_h_unpermuted.view().into_dimensionality::<Ix3>()
+                             .map_err(|e| format!("Error viewing v_current_h as Ix3: {}", e))?;
+
+                        k_combined_h_specific = concatenate(Axis(1), &[k_past_h_view, k_current_h_view])
+                            .map_err(|e| format!("Error concatenating K for head {}: {}", h, e))?.into_dyn();
+                        v_combined_h_specific = concatenate(Axis(1), &[v_past_h_view, v_current_h_view])
+                            .map_err(|e| format!("Error concatenating V for head {}: {}", h, e))?.into_dyn();
+                    }
+                    
+                    cache_entry.key = k_combined_h_specific.clone(); // Update cache
+                    cache_entry.value = v_combined_h_specific.clone(); // Update cache
+                    (k_combined_h_specific, v_combined_h_specific)
+                };
+                
+                current_max_kv_len = k_h_combined.shape()[1]; // batch, S_kv_total, head_dim
+                // Permute for attention: [B, S_kv_total, Dh] -> [B, Dh, S_kv_total] for K_t
+                // Or directly store as [B, S_kv_total, Dh] and permute later after stacking heads
+                k_head_list.push(k_h_combined.into_dimensionality::<Ix3>().unwrap()); // Store as [B, S_kv_total, Dh]
+                v_head_list.push(v_h_combined.into_dimensionality::<Ix3>().unwrap()); // Store as [B, S_kv_total, Dh]
+            }
+
+            // Stack heads together
+            // k_head_list has H elements of [B, S_kv_total, Dh]
+            // Need to make it [B, H, S_kv_total, Dh]
+            let k_stacked_views: Vec<_> = k_head_list.iter().map(|a| a.view().insert_axis(Axis(1))).collect();
+            let k_combined_all_heads = concatenate(Axis(1), &k_stacked_views)
+                .map_err(|e| format!("Error stacking K heads: {}", e))?; // Shape [B, H, S_kv_total, Dh]
+
+            let v_stacked_views: Vec<_> = v_head_list.iter().map(|a| a.view().insert_axis(Axis(1))).collect();
+            let v_combined_all_heads = concatenate(Axis(1), &v_stacked_views)
+                .map_err(|e| format!("Error stacking V heads: {}", e))?; // Shape [B, H, S_kv_total, Dh]
+
+            (k_combined_all_heads.into_dyn(), v_combined_all_heads.into_dyn(), current_max_kv_len)
+
+        } else {
+            // No KV Caching
+            let k_split_no_cache = k_current
+                .into_shape((batch_size, seq_len_q, self.n_head as usize, self.head_dim as usize))
+                .map_err(|e: ShapeError| format!("Error reshaping K (no cache): {}", e.to_string()))?
+                .permuted_axes([0, 2, 1, 3]); // Shape: [B, H, S_q, Dh]
+            let v_split_no_cache = v_current
+                .into_shape((batch_size, seq_len_q, self.n_head as usize, self.head_dim as usize))
+                .map_err(|e: ShapeError| format!("Error reshaping V (no cache): {}", e.to_string()))?
+                .permuted_axes([0, 2, 1, 3]); // Shape: [B, H, S_q, Dh]
+            (k_split_no_cache.into_dyn(), v_split_no_cache.into_dyn(), seq_len_q)
+        };
 
         // Scaled Dot-Product Attention
-        // Transpose K for QK^T: [B, H, S, Dh] -> [B, H, Dh, S]
+        // k_split is [B, H, S_kv, Dh], Transpose K for QK^T: -> [B, H, Dh, S_kv]
         let k_split_transposed = k_split.permuted_axes([0, 1, 3, 2]);
 
         // Batched matrix multiplication for attn_scores = q_split @ k_split_transposed
-        // Result shape: [B, H, S, S]
-        let mut attn_scores_arr = Array::zeros((batch_size, self.n_head as usize, seq_len, seq_len));
+        // q_split: [B, H, S_q, Dh], k_split_transposed: [B, H, Dh, S_kv]
+        // Result shape: [B, H, S_q, S_kv]
+        let mut attn_scores_arr = Array::zeros((batch_size, self.n_head as usize, seq_len_q, seq_len_kv));
+        let q_split_arr4 = q_split.view().into_dimensionality::<Ix4>()
+            .map_err(|e| format!("Failed to view q_split as Ix4: {}", e))?;
+        let k_split_transposed_arr4 = k_split_transposed.view().into_dimensionality::<Ix4>()
+            .map_err(|e| format!("Failed to view k_split_transposed as Ix4: {}", e))?;
+
         for b in 0..batch_size {
             for h_idx in 0..(self.n_head as usize) {
-                let q_slice = q_split.slice(s![b, h_idx, .., ..]);
-                let k_t_slice = k_split_transposed.slice(s![b, h_idx, .., ..]);
+                let q_slice = q_split_arr4.slice(s![b, h_idx, .., ..]);
+                let k_t_slice = k_split_transposed_arr4.slice(s![b, h_idx, .., ..]);
                 let score_slice = q_slice.dot(&k_t_slice);
                 attn_scores_arr.slice_mut(s![b, h_idx, .., ..]).assign(&score_slice);
             }
         }
         
-        let mut attn_scores = attn_scores_arr.into_dyn(); // Convert to ArrayD for further processing
+        let mut attn_scores = attn_scores_arr.into_dyn();
 
         // Scale attention scores
         attn_scores = attn_scores / (self.head_dim as f32).sqrt();
 
-        // Causal Mask Application
-        if let Some(mask) = _attention_mask {
-             // Ensure mask is broadcastable. Example: mask might be [B, 1, 1, S] or [B, 1, S, S]
+        // Attention Mask Application
+        // attn_scores shape: [B, H, S_q, S_kv]
+        if let Some(mask) = attention_mask {
+            // Ensure mask is broadcastable. Example: mask might be [B, 1, S_q, S_kv] or [1, 1, S_q, S_kv]
             attn_scores = attn_scores + mask;
         } else {
-            if seq_len > 1 { // Causal mask only needed if seq_len > 1
-                let mut causal_mask_slice = Array::from_elem((seq_len, seq_len), 0.0f32);
-                for i in 0..seq_len {
-                    for j in (i + 1)..seq_len {
-                        causal_mask_slice[[i,j]] = f32::NEG_INFINITY;
+            // Causal Mask (if no explicit mask provided)
+            if seq_len_q > 1 || (seq_len_q == 1 && seq_len_kv > 1 && layer_kv_cache.is_none()) { // Standard causal for prefill or no cache with S_q > 1
+                 let mut causal_mask_slice = Array::from_elem((seq_len_q, seq_len_kv), 0.0f32);
+                 for i in 0..seq_len_q {
+                    for j in 0..seq_len_kv {
+                        if j > i + (seq_len_kv - seq_len_q) { // Offset j by difference in seq lengths for proper causal masking
+                             causal_mask_slice[[i,j]] = f32::NEG_INFINITY;
+                        }
                     }
-                }
-                let causal_mask = causal_mask_slice
+                 }
+                 // Make it broadcastable: [1, 1, S_q, S_kv]
+                 let causal_mask = causal_mask_slice
                     .into_dyn()
-                    .insert_axis(Axis(0)) // Shape [1, S, S] - Removed ?
-                    .insert_axis(Axis(0)); // Shape [1, 1, S, S] - Removed ?
+                    .insert_axis(Axis(0)) 
+                    .insert_axis(Axis(0)); 
                 attn_scores = attn_scores + &causal_mask;
+
+            } else if seq_len_q == 1 && seq_len_kv > 1 && layer_kv_cache.is_some() {
+                // If generating single token with cache, no positions in S_kv should be masked for this single query token
+                // (unless a specific attention_mask is passed in, which is handled above)
+                // So, effectively, the causal mask is all zeros, meaning no additional masking.
             }
+            // If seq_len_q == 1 and seq_len_kv == 1, no mask needed.
         }
 
+
         // Softmax
-        let attn_probs = softmax(&attn_scores, 3)?; // Softmax along the last axis (dim 3: key_seq_len)
+        // Softmax along the last axis (dim 3: S_kv)
+        let attn_probs = softmax(&attn_scores, 3)?; 
 
         // Apply to V (P@V)
-        // attn_probs shape: [B, H, S, S], v_split shape: [B, H, S, Dh]
-        // Result context_layer_arr shape: [B, H, S, Dh]
+        // attn_probs shape: [B, H, S_q, S_kv], v_split shape: [B, H, S_kv, Dh]
+        // Result context_layer_arr shape: [B, H, S_q, Dh]
         let v_split_arr4 = v_split.view().into_dimensionality::<Ix4>()
             .map_err(|e| format!("Failed to view v_split as Ix4: {}", e))?;
         let attn_probs_arr4 = attn_probs.view().into_dimensionality::<Ix4>()
              .map_err(|e| format!("Failed to view attn_probs as Ix4: {}", e))?;
         
-        let mut context_layer_arr = Array::zeros((batch_size, self.n_head as usize, seq_len, self.head_dim as usize));
+        let mut context_layer_arr = Array::zeros((batch_size, self.n_head as usize, seq_len_q, self.head_dim as usize));
         for b in 0..batch_size {
             for h_idx in 0..(self.n_head as usize) {
                 let prob_slice = attn_probs_arr4.slice(s![b, h_idx, .., ..]);
@@ -213,18 +306,18 @@ feat/gpt2-core-logic-and-weights
         }
 
         // Concatenate Heads
-        // [B, H, S, Dh] -> [B, S, H, Dh]
+        // [B, H, S_q, Dh] -> [B, S_q, H, Dh]
         let context_transposed = context_layer_arr.permuted_axes([0, 2, 1, 3]);
-        // [B, S, H, Dh] -> [B, S, E=H*Dh]
+        // [B, S_q, H, Dh] -> [B, S_q, E=H*Dh]
         let context_reshaped = context_transposed
-            .as_standard_layout() // Ensure memory layout is correct for reshape
-            .into_shape((batch_size, seq_len, self.n_embd as usize))
+            .as_standard_layout() 
+            .into_shape((batch_size, seq_len_q, self.n_embd as usize))
             .map_err(|e: ShapeError| format!("Error reshaping context layer: {}", e.to_string()))?;
 
         // Final Linear Projection
-        // [B, S, E] -> [B*S, E]
+        // [B, S_q, E] -> [B*S_q, E]
         let context_reshaped_2d = context_reshaped
-            .into_shape((batch_size * seq_len, self.n_embd as usize))
+            .into_shape((batch_size * seq_len_q, self.n_embd as usize))
             .map_err(|e: ShapeError| format!("Error reshaping context for final projection: {}", e.to_string()))?;
 
         let c_proj_w_view = self.c_proj_w.view().into_dimensionality::<Ix2>()
@@ -235,9 +328,9 @@ feat/gpt2-core-logic-and-weights
         let output_2d = context_reshaped_2d.dot(&c_proj_w_view) + &c_proj_b_view;
         
         let output = output_2d
-            .into_shape((batch_size, seq_len, self.n_embd as usize))
+            .into_shape((batch_size, seq_len_q, self.n_embd as usize))
             .map_err(|e: ShapeError| format!("Error reshaping output: {}", e.to_string()))?
-            .into_dyn(); // Convert to ArrayD as the final output type
+            .into_dyn();
 
         Ok(output)
 =======
@@ -303,24 +396,45 @@ main
     fn test_mha_forward_shape() {
         let n_head = 2;
         let n_embd = 4;
+        let head_dim = n_embd / n_head;
         let mha = MultiHeadAttention::new(n_head, n_embd).unwrap();
 
         let batch_size = 1;
         let seq_len = 3;
-        let input_hidden_states = ArrayD::zeros(IxDyn(&[batch_size, seq_len, n_embd as usize]));
+        let input_hidden_states = ArrayD::zeros(ndarray::IxDyn(&[batch_size, seq_len, n_embd as usize]));
         
-        // Test without mask
-        let forward_result_no_mask = mha.forward(&input_hidden_states, None);
-        assert!(forward_result_no_mask.is_ok(), "MHA forward (no mask) failed: {:?}", forward_result_no_mask.err());
-        let output_no_mask = forward_result_no_mask.unwrap();
-        assert_eq!(output_no_mask.shape(), &[batch_size, seq_len, n_embd as usize], "Output shape mismatch (no mask)");
+        // Test without mask, without cache
+        let forward_result_no_mask_no_cache = mha.forward(&input_hidden_states, None, None);
+        assert!(forward_result_no_mask_no_cache.is_ok(), "MHA forward (no mask, no cache) failed: {:?}", forward_result_no_mask_no_cache.err());
+        let output_no_mask_no_cache = forward_result_no_mask_no_cache.unwrap();
+        assert_eq!(output_no_mask_no_cache.shape(), &[batch_size, seq_len, n_embd as usize], "Output shape mismatch (no mask, no cache)");
 
-        // Test with mask (mask shape doesn't affect output shape in this placeholder implementation)
-        let attention_mask = ArrayD::ones(IxDyn(&[batch_size, seq_len, seq_len])); // Example mask shape
-        let forward_result_with_mask = mha.forward(&input_hidden_states, Some(&attention_mask));
-        assert!(forward_result_with_mask.is_ok(), "MHA forward (with mask) failed: {:?}", forward_result_with_mask.err());
-        let output_with_mask = forward_result_with_mask.unwrap();
-        assert_eq!(output_with_mask.shape(), &[batch_size, seq_len, n_embd as usize], "Output shape mismatch (with mask)");
+        // Test with mask, without cache
+        let attention_mask_shape = ndarray::IxDyn(&[batch_size, 1, seq_len, seq_len]);
+        let attention_mask = ArrayD::zeros(attention_mask_shape);
+        let forward_result_with_mask_no_cache = mha.forward(&input_hidden_states, Some(&attention_mask), None);
+        assert!(forward_result_with_mask_no_cache.is_ok(), "MHA forward (with mask, no cache) failed: {:?}", forward_result_with_mask_no_cache.err());
+        let output_with_mask_no_cache = forward_result_with_mask_no_cache.unwrap();
+        assert_eq!(output_with_mask_no_cache.shape(), &[batch_size, seq_len, n_embd as usize], "Output shape mismatch (with mask, no cache)");
+    
+        // Test with cache (generation phase, seq_len_q = 1)
+        let mut kv_cache: LayerKVCache = (0..n_head).map(|_| KVCacheEntry {
+            key: Array::zeros((batch_size, seq_len -1, head_dim as usize)).into_dyn(), // prev_seq_len = 2
+            value: Array::zeros((batch_size, seq_len -1, head_dim as usize)).into_dyn(),
+        }).collect();
+        
+        let current_hidden_states = ArrayD::zeros(ndarray::IxDyn(&[batch_size, 1, n_embd as usize])); // S_q = 1
+        let forward_result_with_cache = mha.forward(&current_hidden_states, None, Some(&mut kv_cache));
+        assert!(forward_result_with_cache.is_ok(), "MHA forward (with cache) failed: {:?}", forward_result_with_cache.err());
+        let output_with_cache = forward_result_with_cache.unwrap();
+        assert_eq!(output_with_cache.shape(), &[batch_size, 1, n_embd as usize], "Output shape mismatch (with cache)");
+
+        // Check cache updated shapes
+        for head_cache in kv_cache.iter() {
+            // Previous_seq_len (2) + current_seq_len (1) = new_seq_len (3)
+            assert_eq!(head_cache.key.shape(), &[batch_size, seq_len, head_dim as usize]);
+            assert_eq!(head_cache.value.shape(), &[batch_size, seq_len, head_dim as usize]);
+        }
     }
 
     // A value-based test is not feasible until the forward pass is implemented with actual logic.
