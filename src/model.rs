@@ -6,7 +6,7 @@ use std::convert::TryInto;
 use std::fs::File;
 use std::io::Read;
 use crate::config::GPT2Config;
-use crate::common::{LayerNorm, ModelKVCache}; // Import ModelKVCache
+use crate::common::{LayerNorm, ModelKVCache, LayerKVCache}; // Import ModelKVCache and LayerKVCache
 use crate::attention::MultiHeadAttention;
 use crate::mlp::MLP;
 
@@ -36,15 +36,14 @@ impl TransformerBlock {
     }
 
     pub fn forward(
-        &mut self, // Changed to &mut self
+        &self,
         hidden_states: &ArrayD<f32>, 
-        _layer_kv_cache: &mut Vec<f32>, // Prefixed as it's not used in placeholder
-        _theta_hat: f32 
+        attention_mask: Option<&ArrayD<f32>>,
+        layer_kv_cache: Option<&mut LayerKVCache>
     ) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
- feat/gpt2-core-logic-and-weights
         // Self-Attention Path
         let ln_1_output = self.ln_1.forward(hidden_states)?;
-        let attn_output = self.attn.forward(&ln_1_output, attention_mask)?;
+        let attn_output = self.attn.forward(&ln_1_output, attention_mask, layer_kv_cache)?;
         // Add the first residual connection
         // hidden_states is &ArrayD<f32>, attn_output is ArrayD<f32>
         // The + operator for &ArrayD + &ArrayD produces an owned ArrayD.
@@ -121,23 +120,39 @@ impl GPT2Model {
     }
 
     pub fn forward(
-        &mut self, // Changed to &mut self
-        input_ids: &Array2<i32>, 
-        model_cache: &mut ModelKVCache, // Added model_cache
-        theta_hat: f32 // Added theta_hat
+        &self,
+        input_ids: &Array2<i32>,
+        attention_mask_option: Option<&ArrayD<f32>>,
+        model_kv_cache: Option<&mut ModelKVCache>, // ModelKVCache is Vec<LayerKVCache>
     ) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
         let batch_size = input_ids.shape()[0];
-        let seq_len = input_ids.shape()[1];
-        
- feat/gpt2-core-logic-and-weights
-        // n_embd is the dimensionality of the embeddings.
-        // self.wte_weight is ArrayD but used as 2D [vocab_size, n_embd].
-        let n_embd = self.wte_weight.shape()[1]; // n_embd is usize here
+        let current_seq_len = input_ids.shape()[1];
+        let n_embd = self.wte_weight.shape()[1];
 
-        // 1. Token Embeddings
-        let mut token_embeddings_arr3 = Array::zeros((batch_size, seq_len, n_embd)); // Array3<f32>
+        // 1. Determine past_seq_len from cache
+        let past_seq_len = match model_kv_cache.as_ref() {
+            Some(cache) if !cache.is_empty() && !cache[0].is_empty() => {
+                // Assuming KVCacheEntry.key shape is [Batch, Seq, HeadDim]
+                // And LayerKVCache is Vec<KVCacheEntry> (one per head)
+                // And ModelKVCache is Vec<LayerKVCache> (one per layer)
+                cache[0][0].key.shape()[1] 
+            }
+            _ => 0,
+        };
+
+        // 2. Initialize cache if provided Some(empty_vec)
+        if let Some(cache_ref) = model_kv_cache.as_mut() {
+            if cache_ref.is_empty() {
+                *cache_ref = vec![Vec::new(); self.h.len()];
+                // Each LayerKVCache (inner Vec) will be populated by MultiHeadAttention
+                // if it's also empty for a given head during the first call with cache.
+            }
+        }
+        
+        // 3. Token Embeddings
+        let mut token_embeddings_arr3 = Array::zeros((batch_size, current_seq_len, n_embd));
         for b in 0..batch_size {
-            for s_idx in 0..seq_len {
+            for s_idx in 0..current_seq_len {
                 let token_id = input_ids[[b, s_idx]] as usize;
                 if token_id >= self.wte_weight.shape()[0] {
                     return Err(format!("Token ID {} at [{},{}] is out of vocab size {}", 
@@ -147,7 +162,7 @@ impl GPT2Model {
                 token_embeddings_arr3.slice_mut(s![b, s_idx, ..]).assign(&embedding_vector_view);
             }
         }
-        let mut hidden_states = token_embeddings_arr3.into_dyn(); // Now ArrayD<f32>
+        let mut hidden_states = token_embeddings_arr3.into_dyn();
 =======
         let n_embd = self.wte_weight.shape()[1]; 
 
@@ -156,30 +171,44 @@ impl GPT2Model {
         let token_embeddings = ArrayD::zeros(IxDyn(&[batch_size, seq_len, n_embd]));
 main
 
-        // 2. Positional Embeddings
-        if seq_len > self.wpe_weight.shape()[0] {
-            return Err(format!(
-                "Sequence length ({}) exceeds maximum positional embeddings ({})",
-                seq_len, self.wpe_weight.shape()[0]
+        // 4. Positional Embeddings
+        let position_ids: Vec<usize> = (past_seq_len..past_seq_len + current_seq_len).collect();
+        if position_ids.last().unwrap_or(&0) >= &self.wpe_weight.shape()[0] {
+             return Err(format!(
+                "Max position id ({}) exceeds maximum positional embeddings ({})",
+                position_ids.last().unwrap_or(&0), self.wpe_weight.shape()[0]
             ).into());
         }
-        let positional_embeddings_slice = self.wpe_weight.slice(s![..seq_len, ..]);
-        let positional_embeddings_owned: ArrayD<f32> = positional_embeddings_slice.to_owned().into_dyn(); // into_dyn() restored
-        let positional_embeddings_broadcastable = positional_embeddings_owned.insert_axis(Axis(0));
+
+        let mut positional_embeddings_arr = Array::zeros((current_seq_len, n_embd));
+        for (i, &pos_id) in position_ids.iter().enumerate() {
+            let pos_embedding_slice = self.wpe_weight.slice(s![pos_id, ..]);
+            positional_embeddings_arr.slice_mut(s![i, ..]).assign(&pos_embedding_slice);
+        }
+        // Reshape to [1, current_seq_len, n_embd] for broadcasting
+        let positional_embeddings_broadcastable = positional_embeddings_arr
+            .into_shape((1, current_seq_len, n_embd))
+            .map_err(|e: ShapeError| format!("Error reshaping positional_embeddings: {}", e.to_string()))?
+            .into_dyn();
         
-feat/gpt2-core-logic-and-weights
-        // 3. Add token and positional embeddings
-        // token_embeddings: [batch_size, seq_len, n_embd]
-        // positional_embeddings_broadcastable: [1, seq_len, n_embd]
-        // Resulting inputs_embeds: [batch_size, seq_len, n_embd]
+        // 5. Add token and positional embeddings
         hidden_states = hidden_states + positional_embeddings_broadcastable;
         
-        // Process Through Transformer Blocks
-        for block in &self.h {
-            hidden_states = block.forward(&hidden_states, _attention_mask)?;
+        // 6. Process Through Transformer Blocks
+        let mut current_model_kv_cache = model_kv_cache; // Shadow original binding
+        for (block_idx, block) in self.h.iter().enumerate() {
+            let layer_cache_opt = current_model_kv_cache.as_mut().map(|cache| &mut cache[block_idx]);
+            
+            // Determine effective_attention_mask (simplified as per instructions)
+            // If attention_mask_option is Some, it's used directly by MHA if passed.
+            // If None, MHA's internal causal masking (or lack thereof for seq_len_q=1 with cache) applies.
+            // The subtask implies we let MHA handle the "None" case logic for causal masking.
+            let effective_attention_mask = attention_mask_option;
+
+            hidden_states = block.forward(&hidden_states, effective_attention_mask, layer_cache_opt)?;
         }
 
-        // Apply Final Layer Normalization
+        // 7. Apply Final Layer Normalization
         hidden_states = self.ln_f.forward(&hidden_states)?;
         
         Ok(hidden_states)
@@ -386,53 +415,81 @@ impl GPT2Model {
 
 
     pub fn generate(
-        &self, 
-        tokenizer: &Tokenizer, 
-        prompt_ids: &[i32], 
-        max_length: usize, 
-        eos_token_id: i32
+        &self,
+        tokenizer: &Tokenizer,
+        prompt_ids: &[i32],
+        max_length: usize,
+        eos_token_id: i32,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let mut current_token_sequence: Vec<i32> = prompt_ids.to_vec();
-
         if prompt_ids.is_empty() {
             return Err("Prompt cannot be empty.".into());
         }
-        if max_length <= prompt_ids.len() {
-            // Just decode the prompt if max_length is not greater
-            let token_ids_u32: Vec<u32> = current_token_sequence.iter().map(|&id| id as u32).collect();
-            let decoded_text = tokenizer.decode(&token_ids_u32, true).map_err(|e| e.to_string())?;
-            return Ok(decoded_text);
+
+        let mut current_token_sequence: Vec<i32> = prompt_ids.to_vec();
+
+        if max_length <= current_token_sequence.len() {
+            let token_ids_u32: Vec<u32> = current_token_sequence.iter().map(|&id| *id as u32).collect();
+            return tokenizer.decode(&token_ids_u32, true).map_err(|e| e.to_string());
         }
 
-        let max_new_tokens = max_length - prompt_ids.len();
+        let max_new_tokens = max_length - current_token_sequence.len();
+        let mut model_kv_cache: ModelKVCache = Vec::new(); // Initialize KV Cache
 
-        for _ in 0..max_new_tokens {
-            let current_seq_len = current_token_sequence.len();
-            let input_array = Array2::from_shape_vec((1, current_seq_len), current_token_sequence.clone())
-                .map_err(|e| format!("Failed to create input array: {}", e))?;
+        // Prefill step: Process the initial prompt
+        if !current_token_sequence.is_empty() {
+            let prefill_input_array = Array2::from_shape_vec((1, current_token_sequence.len()), current_token_sequence.clone())
+                .map_err(|e| format!("Failed to create prefill input array: {}", e))?;
             
-            let final_hidden_states = self.forward(&input_array, None)?;
-            let all_logits_dyn = self.lm_head(&final_hidden_states)?; // Shape: [1, current_seq_len, vocab_size]
+            let prefill_hidden_states = self.forward(&prefill_input_array, None, Some(&mut model_kv_cache))?;
+            let prefill_logits_dyn = self.lm_head(&prefill_hidden_states)?; // Shape: [1, prompt_len, vocab_size]
 
-            // Get logits for the very last token position
-            let next_token_logits_view_dyn = all_logits_dyn.slice(s![0, current_seq_len - 1, ..]);
-            let next_token_logits_view_1d = next_token_logits_view_dyn.view().into_dimensionality::<Ix1>()
-                .map_err(|e| format!("Failed to convert next_token_logits to 1D: {}. Shape was {:?}", e, next_token_logits_view_dyn.shape()))?;
+            // Get logits for the last token of the prompt
+            let last_token_logits_view_dyn = prefill_logits_dyn.slice(s![0, current_token_sequence.len() - 1, ..]);
+            let last_token_logits_view_1d = last_token_logits_view_dyn.view().into_dimensionality::<Ix1>()
+                .map_err(|e| format!("Failed to convert prefill last_token_logits to 1D: {}. Shape was {:?}", e, last_token_logits_view_dyn.shape()))?;
             
-            let predicted_token_idx = argmax(next_token_logits_view_1d);
+            let predicted_token_idx = argmax(last_token_logits_view_1d);
             let predicted_token_id = predicted_token_idx as i32;
-
+            
             current_token_sequence.push(predicted_token_id);
 
-            if predicted_token_id == eos_token_id {
+            if predicted_token_id == eos_token_id || current_token_sequence.len() >= max_length {
+                let token_ids_u32: Vec<u32> = current_token_sequence.iter().map(|&id| *id as u32).collect();
+                return tokenizer.decode(&token_ids_u32, true).map_err(|e| e.to_string());
+            }
+        }
+        
+        // Generation loop for remaining tokens
+        // Loop `max_new_tokens - 1` times if prefill generated one, or `max_new_tokens` if prompt was empty (though handled)
+        // More robustly: loop until `current_token_sequence.len()` reaches `max_length`.
+        for _ in 0..(max_new_tokens -1) { // -1 because one token was already generated after prefill
+            if current_token_sequence.is_empty() { // Should not happen if prompt is not empty
+                return Err("Token sequence became empty during generation".into());
+            }
+            let last_predicted_token_id = *current_token_sequence.last().unwrap();
+            let single_token_input_array = Array2::from_shape_vec((1, 1), vec![last_predicted_token_id])
+                .map_err(|e| format!("Failed to create single token input array: {}", e))?;
+
+            let hidden_states_gen = self.forward(&single_token_input_array, None, Some(&mut model_kv_cache))?;
+            let logits_dyn_gen = self.lm_head(&hidden_states_gen)?; // Shape: [1, 1, vocab_size]
+
+            // Get logits for the single generated token
+            let next_token_logits_view_dyn = logits_dyn_gen.slice(s![0, 0, ..]);
+            let next_token_logits_view_1d = next_token_logits_view_dyn.view().into_dimensionality::<Ix1>()
+                 .map_err(|e| format!("Failed to convert gen next_token_logits to 1D: {}. Shape was {:?}", e, next_token_logits_view_dyn.shape()))?;
+            
+            let predicted_token_idx = argmax(next_token_logits_view_1d);
+            let new_predicted_token_id = predicted_token_idx as i32;
+
+            current_token_sequence.push(new_predicted_token_id);
+
+            if new_predicted_token_id == eos_token_id || current_token_sequence.len() >= max_length {
                 break;
             }
         }
 
-        let token_ids_u32: Vec<u32> = current_token_sequence.iter().map(|&id| id as u32).collect();
-        let decoded_text = tokenizer.decode(&token_ids_u32, true).map_err(|e| e.to_string())?;
-        
-        Ok(decoded_text)
+        let token_ids_u32: Vec<u32> = current_token_sequence.iter().map(|&id| *id as u32).collect();
+        tokenizer.decode(&token_ids_u32, true).map_err(|e| e.to_string())
     }
 }
 
@@ -739,23 +796,32 @@ mod tests {
     #[test]
     fn test_transformer_block_forward_shape() {
         let config = create_test_config(4, 2, 1, 10, 10);
-        let mut block = TransformerBlock::new(&config).unwrap();
+        let block = TransformerBlock::new(&config).unwrap(); // Use &self, so block doesn't need to be mut
         
         let batch_size = 1;
         let seq_len = 5;
-        let n_embd = config.n_embd as usize;
-        let hidden_states = ArrayD::zeros(IxDyn(&[batch_size, seq_len, n_embd]));
+        let n_embd_usize = config.n_embd as usize; // Use usize for shape
+        let hidden_states = ArrayD::zeros(IxDyn(&[batch_size, seq_len, n_embd_usize]));
         
-        // Dummy cache for one layer. The actual structure of Vec<f32> for cache is simplified.
-        // A real cache might be more complex (e.g., storing K and V tensors).
-        // For the placeholder `block.forward`, its content doesn't matter much.
-        let mut layer_kv_cache: Vec<f32> = Vec::new(); 
-        let theta_hat = 1.0;
+        // Test without cache
+        let output_result_no_cache = block.forward(&hidden_states, None, None);
+        assert!(output_result_no_cache.is_ok(), "TransformerBlock::forward (no cache) failed: {:?}", output_result_no_cache.err());
+        let output_no_cache = output_result_no_cache.unwrap();
+        assert_eq!(output_no_cache.shape(), &[batch_size, seq_len, n_embd_usize], "TransformerBlock forward (no cache) output shape mismatch");
 
-        let output_result = block.forward(&hidden_states, &mut layer_kv_cache, theta_hat);
-        assert!(output_result.is_ok(), "TransformerBlock::forward failed: {:?}", output_result.err());
-        let output = output_result.unwrap();
-        assert_eq!(output.shape(), &[batch_size, seq_len, n_embd], "TransformerBlock forward output shape mismatch");
+        // Test with cache (dummy cache, as the internal structure of LayerKVCache is complex)
+        // For shape testing, we just need to pass Some(&mut cache).
+        let mut dummy_kv_cache: LayerKVCache = (0..config.n_head).map(|_| {
+            crate::common::KVCacheEntry { // Explicitly qualify KVCacheEntry
+                key: ArrayD::zeros(IxDyn(&[batch_size, 0, n_embd_usize / config.n_head as usize])), // S=0 for initial
+                value: ArrayD::zeros(IxDyn(&[batch_size, 0, n_embd_usize / config.n_head as usize])),
+            }
+        }).collect();
+
+        let output_result_with_cache = block.forward(&hidden_states, None, Some(&mut dummy_kv_cache));
+        assert!(output_result_with_cache.is_ok(), "TransformerBlock::forward (with cache) failed: {:?}", output_result_with_cache.err());
+        let output_with_cache = output_result_with_cache.unwrap();
+        assert_eq!(output_with_cache.shape(), &[batch_size, seq_len, n_embd_usize], "TransformerBlock forward (with cache) output shape mismatch");
     }
 
     #[test]
@@ -771,25 +837,202 @@ mod tests {
 
     #[test]
     fn test_gpt2model_forward_smoke_test() {
-        let config = create_test_config(4, 2, 1, 10, 10); // n_embd=4, n_head=2, n_layer=1
-        let mut model = GPT2Model::new(&config).unwrap();
+        let n_embd = 4;
+        let n_head = 2;
+        let n_layer = 1;
+        let vocab_size = 10;
+        let n_positions = 10;
+        let config = create_test_config(n_embd, n_head, n_layer, vocab_size, n_positions);
+        let model = GPT2Model::new(&config).unwrap(); // GPT2Model::new returns Self, not &mut Self
         
         let batch_size = 1;
         let seq_len = 5;
-        let input_ids_data = vec![0i32; batch_size * seq_len]; // Dummy token IDs
+        let input_ids_data = vec![0i32; batch_size * seq_len]; 
         let input_ids = Array2::from_shape_vec((batch_size, seq_len), input_ids_data).unwrap();
         
-        // Initialize a dummy model_cache. It's Vec<Vec<f32>>.
-        // One inner Vec<f32> per layer.
-        let mut model_cache: ModelKVCache = vec![Vec::new(); config.n_layer as usize];
-        let theta_hat = 1.0;
+        // Test with no cache
+        let output_no_cache_result = model.forward(&input_ids, None, None);
+        assert!(output_no_cache_result.is_ok(), "GPT2Model::forward (no cache) failed: {:?}", output_no_cache_result.err());
+        let output_no_cache = output_no_cache_result.unwrap();
+        assert_eq!(output_no_cache.shape(), &[batch_size, seq_len, n_embd as usize], "GPT2Model forward (no cache) output shape mismatch");
 
-        let output_result = model.forward(&input_ids, &mut model_cache, theta_hat);
-        assert!(output_result.is_ok(), "GPT2Model::forward failed: {:?}", output_result.err());
-        let output = output_result.unwrap();
+        // Test with cache (initially empty)
+        let mut model_kv_cache_data: ModelKVCache = Vec::new();
+        let output_with_empty_cache_result = model.forward(&input_ids, None, Some(&mut model_kv_cache_data));
+        assert!(output_with_empty_cache_result.is_ok(), "GPT2Model::forward (empty cache) failed: {:?}", output_with_empty_cache_result.err());
+        let output_with_empty_cache = output_with_empty_cache_result.unwrap();
+        assert_eq!(output_with_empty_cache.shape(), &[batch_size, seq_len, n_embd as usize], "GPT2Model forward (empty cache) output shape mismatch");
+        assert_eq!(model_kv_cache_data.len(), n_layer as usize, "Cache should be initialized for all layers");
+    }
+
+    #[test]
+    fn test_gpt2model_forward_with_kv_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let n_embd = 4;
+        let n_head = 2;
+        let n_layer = 2; // Use 2 layers for a slightly more comprehensive test
+        let vocab_size = 10;
+        let n_positions = 20; // Enough for prefill + generate
+        let config = create_test_config(n_embd, n_head, n_layer, vocab_size, n_positions);
+        let model = GPT2Model::new(&config)?;
+
+        let batch_size = 1;
+        let head_dim = n_embd as usize / n_head as usize;
+
+        // 1. Prefill step
+        let prefill_seq_len = 3;
+        let prefill_input_ids_data: Vec<i32> = (0..prefill_seq_len).map(|i| i as i32).collect();
+        let prefill_input_ids = Array2::from_shape_vec((batch_size, prefill_seq_len), prefill_input_ids_data)?;
         
-        // Expected output shape: [batch_size, seq_len, vocab_size]
-        assert_eq!(output.shape(), &[batch_size, seq_len, config.vocab_size as usize], "GPT2Model forward output shape mismatch (logits)");
- main
+        let mut model_kv_cache: ModelKVCache = Vec::new(); // Initially empty
+
+        let prefill_output_result = model.forward(&prefill_input_ids, None, Some(&mut model_kv_cache));
+        assert!(prefill_output_result.is_ok(), "Prefill failed: {:?}", prefill_output_result.err());
+        let prefill_output = prefill_output_result.unwrap();
+        assert_eq!(prefill_output.shape(), &[batch_size, prefill_seq_len, n_embd as usize], "Prefill output shape mismatch");
+        
+        assert_eq!(model_kv_cache.len(), n_layer as usize, "Cache not initialized for all layers after prefill");
+        for layer_idx in 0..n_layer as usize {
+            assert_eq!(model_kv_cache[layer_idx].len(), n_head as usize, "Layer {} cache not initialized for all heads", layer_idx);
+            for head_idx in 0..n_head as usize {
+                assert_eq!(model_kv_cache[layer_idx][head_idx].key.shape(), &[batch_size, prefill_seq_len, head_dim], "Layer {}, Head {} key shape mismatch after prefill", layer_idx, head_idx);
+                assert_eq!(model_kv_cache[layer_idx][head_idx].value.shape(), &[batch_size, prefill_seq_len, head_dim], "Layer {}, Head {} value shape mismatch after prefill", layer_idx, head_idx);
+            }
+        }
+
+        // 2. Generation step (one token)
+        let gen_seq_len = 1;
+        let gen_input_ids_data: Vec<i32> = vec![prefill_seq_len as i32]; // Next token ID
+        let gen_input_ids = Array2::from_shape_vec((batch_size, gen_seq_len), gen_input_ids_data)?;
+
+        let gen_output_result = model.forward(&gen_input_ids, None, Some(&mut model_kv_cache));
+        assert!(gen_output_result.is_ok(), "Generation failed: {:?}", gen_output_result.err());
+        let gen_output = gen_output_result.unwrap();
+        assert_eq!(gen_output.shape(), &[batch_size, gen_seq_len, n_embd as usize], "Generation output shape mismatch");
+
+        let expected_total_seq_len = prefill_seq_len + gen_seq_len;
+        for layer_idx in 0..n_layer as usize {
+            assert_eq!(model_kv_cache[layer_idx].len(), n_head as usize, "Layer {} cache lost heads after generation", layer_idx);
+            for head_idx in 0..n_head as usize {
+                 assert_eq!(model_kv_cache[layer_idx][head_idx].key.shape(), &[batch_size, expected_total_seq_len, head_dim], "Layer {}, Head {} key shape mismatch after generation", layer_idx, head_idx);
+                 assert_eq!(model_kv_cache[layer_idx][head_idx].value.shape(), &[batch_size, expected_total_seq_len, head_dim], "Layer {}, Head {} value shape mismatch after generation", layer_idx, head_idx);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_kv_cache_numerical_consistency() -> Result<(), Box<dyn std::error::Error>> {
+        let n_embd = 8; // Increased slightly for more complex interactions
+        let n_head = 2;
+        let n_layer = 2; // Use 2 layers
+        let vocab_size = 16; // Small vocab
+        let n_positions = 32; // Max sequence length for test
+        let config = create_test_config(n_embd, n_head, n_layer, vocab_size, n_positions);
+        
+        // It's important that the model weights are not all zeros for this test,
+        // otherwise logits might be trivially consistent (e.g. all zeros).
+        // The default new() initializes with zeros. For a real test, load_weights or random init would be better.
+        // However, the existing test suite implies new() is used. We'll proceed, but note this limitation.
+        // If weights are zero, ln_f output might be NaN if variance is zero, leading to NaN logits.
+        // Let's initialize LayerNorm weights to 1.0 and biases to 0.1 to avoid NaNs from zero variance.
+        // And wte/wpe with small non-zero values.
+        let mut model = GPT2Model::new(&config)?;
+        // Initialize weights to something non-zero to avoid trivial consistency or NaNs
+        model.wte_weight = ArrayD::from_elem(model.wte_weight.shape(), 0.1);
+        model.wpe_weight = ArrayD::from_elem(model.wpe_weight.shape(), 0.05);
+        for layer in model.h.iter_mut() {
+            layer.ln_1._weight = ArrayD::from_elem(layer.ln_1._weight.shape(), 1.0);
+            layer.ln_1._bias = ArrayD::from_elem(layer.ln_1._bias.shape(), 0.1);
+            layer.ln_2._weight = ArrayD::from_elem(layer.ln_2._weight.shape(), 1.0);
+            layer.ln_2._bias = ArrayD::from_elem(layer.ln_2._bias.shape(), 0.1);
+            // Also initialize MHA and MLP weights if they are all zeros by default
+            layer.attn.c_attn_w = ArrayD::from_elem(layer.attn.c_attn_w.shape(), 0.02);
+            layer.attn.c_attn_b = ArrayD::from_elem(layer.attn.c_attn_b.shape(), 0.01);
+            layer.attn.c_proj_w = ArrayD::from_elem(layer.attn.c_proj_w.shape(), 0.02);
+            layer.attn.c_proj_b = ArrayD::from_elem(layer.attn.c_proj_b.shape(), 0.01);
+            layer.mlp.c_fc_w = ArrayD::from_elem(layer.mlp.c_fc_w.shape(), 0.02);
+            layer.mlp.c_fc_b = ArrayD::from_elem(layer.mlp.c_fc_b.shape(), 0.01);
+            layer.mlp.c_proj_w = ArrayD::from_elem(layer.mlp.c_proj_w.shape(), 0.02);
+            layer.mlp.c_proj_b = ArrayD::from_elem(layer.mlp.c_proj_b.shape(), 0.01);
+        }
+        model.ln_f._weight = ArrayD::from_elem(model.ln_f._weight.shape(), 1.0);
+        model.ln_f._bias = ArrayD::from_elem(model.ln_f._bias.shape(), 0.1);
+
+
+        let prompt_ids: Vec<i32> = vec![1, 2];
+        let num_new_tokens_to_generate = 3;
+        let batch_size = 1;
+
+        let mut logits_history_no_cache: Vec<ArrayD<f32>> = Vec::new();
+        let mut generated_tokens_no_cache: Vec<i32> = Vec::new();
+
+        // Scenario 1: No Cache
+        let mut current_sequence_no_cache = prompt_ids.clone();
+        for _ in 0..num_new_tokens_to_generate {
+            let current_input_ids_array = Array2::from_shape_vec((batch_size, current_sequence_no_cache.len()), current_sequence_no_cache.clone())?;
+            
+            let hidden_states = model.forward(&current_input_ids_array, None, None)?;
+            let logits_all_tokens = model.lm_head(&hidden_states)?; // Shape: [B, S, V]
+            
+            // Get logits for the last token
+            let last_token_logits = logits_all_tokens.slice(s![0, current_sequence_no_cache.len() - 1, ..]).to_owned();
+            logits_history_no_cache.push(last_token_logits.clone().into_dyn());
+            
+            let next_token_id = argmax(last_token_logits.view().into_dimensionality::<Ix1>()?) as i32;
+            generated_tokens_no_cache.push(next_token_id);
+            current_sequence_no_cache.push(next_token_id);
+        }
+
+        let mut logits_history_with_cache: Vec<ArrayD<f32>> = Vec::new();
+        let mut generated_tokens_with_cache: Vec<i32> = Vec::new();
+        let mut model_kv_cache: ModelKVCache = Vec::new();
+
+        // Scenario 2: With KV Cache
+        // Prefill
+        let prompt_array = Array2::from_shape_vec((batch_size, prompt_ids.len()), prompt_ids.clone())?;
+        let hidden_states_prefill = model.forward(&prompt_array, None, Some(&mut model_kv_cache))?;
+        let logits_prefill_all = model.lm_head(&hidden_states_prefill)?;
+        let last_token_logits_prefill = logits_prefill_all.slice(s![0, prompt_ids.len() - 1, ..]).to_owned();
+        logits_history_with_cache.push(last_token_logits_prefill.clone().into_dyn());
+        
+        let next_token_id_prefill = argmax(last_token_logits_prefill.view().into_dimensionality::<Ix1>()?) as i32;
+        generated_tokens_with_cache.push(next_token_id_prefill);
+
+        // Iterative generation
+        let mut current_token_for_generation = next_token_id_prefill;
+        for _ in 1..num_new_tokens_to_generate { // Loop N-1 times
+            let single_token_input_array = Array2::from_shape_vec((batch_size, 1), vec![current_token_for_generation])?;
+            let hidden_states_iter = model.forward(&single_token_input_array, None, Some(&mut model_kv_cache))?;
+            let logits_iter_all = model.lm_head(&hidden_states_iter)?; // Shape: [B, 1, V]
+            
+            let current_token_logits_iter = logits_iter_all.slice(s![0, 0, ..]).to_owned(); // Logits for the single input token
+            logits_history_with_cache.push(current_token_logits_iter.clone().into_dyn());
+
+            let next_token_id_iter = argmax(current_token_logits_iter.view().into_dimensionality::<Ix1>()?) as i32;
+            generated_tokens_with_cache.push(next_token_id_iter);
+            current_token_for_generation = next_token_id_iter;
+        }
+        
+        // Compare generated tokens (simpler check)
+        assert_eq!(generated_tokens_no_cache, generated_tokens_with_cache, "Generated token sequences differ");
+
+        // Compare logits history (more rigorous check)
+        assert_eq!(logits_history_no_cache.len(), num_new_tokens_to_generate);
+        assert_eq!(logits_history_with_cache.len(), num_new_tokens_to_generate);
+
+        for i in 0..num_new_tokens_to_generate {
+            let logits_nc = &logits_history_no_cache[i];
+            let logits_wc = &logits_history_with_cache[i];
+            assert_eq!(logits_nc.shape(), logits_wc.shape(), "Logits shapes differ at step {}", i);
+            
+            // Ensure logits_nc and logits_wc are 1D for comparison or iterate if they are higher D
+             let logits_nc_flat = logits_nc.iter();
+             let logits_wc_flat = logits_wc.iter();
+
+            for (val_nc, val_wc) in logits_nc_flat.zip(logits_wc_flat) {
+                 assert_abs_diff_eq!(*val_nc, *val_wc, epsilon = 1e-5, "Logit values differ at step {}, value_nc: {}, value_wc: {}", i, val_nc, val_wc);
+            }
+        }
+        Ok(())
     }
 }
