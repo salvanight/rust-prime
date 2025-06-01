@@ -192,20 +192,22 @@ impl TokenizerWrapper {
             source_message: "Invalid merges path (not valid UTF-8)".to_string()
         })?;
 
-        let bpe_model = BPE::from_files(vocab_str, merges_str)
-            .unk_token("<|endoftext|>") 
-            .build()
+        let bpe_builder = BPE::builder()
+            .files(vocab_str.to_string(), merges_str.to_string())
+            .unk_token("<|endoftext|>".to_string());
+
+        let bpe_model = bpe_builder.build()
             .map_err(|e| TokenizerError::Library(format!("Failed to build BPE model: {}", e)))?;
 
-        let mut tokenizer = Tokenizer::new(Box::new(bpe_model));
+        let mut tokenizer = Tokenizer::new(bpe_model);
 
         // GPT-2 uses byte-level pre-tokenization without adding a prefix space by default.
         // ByteLevelPretokenizer::new(add_prefix_space: bool, trim_offsets: bool (use_regex in some versions))
         // For GPT-2, add_prefix_space is typically false. trim_offsets is true.
-        let pre_tokenizer = ByteLevelPretokenizer::new(false, true);
-        tokenizer.with_pre_tokenizer(Box::new(pre_tokenizer));
+        let pre_tokenizer = ByteLevelPretokenizer::new(false, true, true);
+        tokenizer.with_pre_tokenizer(pre_tokenizer);
         
-        tokenizer.with_decoder(Box::new(ByteLevelDecoder::default()));
+        tokenizer.with_decoder(ByteLevelDecoder::default());
 
         #[cfg(feature = "tokenizer-debug-logs")]
         trace!(
@@ -327,7 +329,8 @@ impl TokenizerWrapper {
         if let Some(ref params) = truncation_params {
             trace!("Applying truncation parameters: {:?}", params);
         }
-        tokenizer_instance.set_truncation(truncation_params)
+        // Assuming with_truncation exists and returns Result
+        tokenizer_instance.with_truncation(truncation_params.clone())
             .map_err(|e| TokenizerError::EncodingFailed {
                 text: format!("Failed to set truncation for text '{}'", if text.len() > 50 { &text[..50] } else { text }),
                 source_message: e.to_string(),
@@ -337,11 +340,8 @@ impl TokenizerWrapper {
         if let Some(ref params) = padding_params {
             trace!("Applying padding parameters: {:?}", params);
         }
-        tokenizer_instance.set_padding(padding_params)
-            .map_err(|e| TokenizerError::EncodingFailed {
-                text: format!("Failed to set padding for text '{}'", if text.len() > 50 { &text[..50] } else { text }),
-                source_message: e.to_string(),
-            })?;
+        // with_padding returns &mut Self, so no map_err or ?
+        tokenizer_instance.with_padding(padding_params.clone());
 
         let encoding_result = tokenizer_instance.encode(text, add_special_tokens)
             .map_err(|e| TokenizerError::EncodingFailed {
@@ -433,8 +433,7 @@ impl TokenizerWrapper {
         #[cfg(feature = "tokenizer-debug-logs")]
         debug!("Adding new tokens: {:?}", tokens);
 
-        let num_added = self.tokenizer.add_tokens(tokens)
-            .map_err(|e| TokenizerError::Library(format!("Failed to add new tokens: {}", e)))?;
+        let num_added = self.tokenizer.add_tokens(tokens);
         
         #[cfg(feature = "tokenizer-debug-logs")]
         trace!("Successfully added {} tokens. New vocab size: {}", num_added, self.tokenizer.get_vocab_size(true));
@@ -470,56 +469,54 @@ mod tests {
 
     // Define the dummy tokenizer JSON content
     // This structure is based on typical Hugging Face tokenizer files.
-    const DUMMY_TOKENIZER_JSON: &str = r#"
-    {
-      "model": {
-        "type": "BPE",
-        "vocab": {
-          "[PAD]": 0,
-          "[UNK]": 1,
-          "[CLS]": 2,
-          "[SEP]": 3,
-          "[MASK]": 4,
-          "hello": 5,
-          "world": 6,
-          "##d": 7,
-          "Ġ": 8,
-          "Ġhello": 9,
-          "Ġworld": 10,
-          "Ġ##d" : 11
-        },
-        "merges": [
-          "Ġ h",      // For " hello" -> "Ġhello"
-          "Ġ w",      // For " world" -> "Ġworld"
-          "h e",      // For "hello"
-          "l l",
-          "o w",      // Not used by "hello" or "world" directly but good for BPE example
-          "r l",      // For "world"
-          "l d",      // For "world"
-          "Ġ ##",     // For "Ġ##d"
-          "## d"      // For "Ġ##d"
-        ]
-      },
-      "normalizer": {
-        "type": "BertNormalizer",
-        "lowercase": true,
-        "strip_accents": true,
-        "clean_text": true
-      },
-      "pre_tokenizer": {
-        "type": "BertPreTokenizer"
-      },
-      "post_processor": {
-        "type": "BertProcessing",
-        "sep": ["[SEP]", 3],
-        "cls": ["[CLS]", 2]
-      },
-      "decoder": {
-        "type": "BPEDecoder",
-        "suffix": "Ġ" 
-      }
-    }
-    "#;
+    const DUMMY_TOKENIZER_JSON: &str = "{\n\
+      \"model\": {\n\
+        \"type\": \"BPE\",\n\
+        \"vocab\": {\n\
+          \"[PAD]\": 0,\n\
+          \"[UNK]\": 1,\n\
+          \"[CLS]\": 2,\n\
+          \"[SEP]\": 3,\n\
+          \"[MASK]\": 4,\n\
+          \"hello\": 5,\n\
+          \"world\": 6,\n\
+          \"##d\": 7,\n\
+          \"Ġ\": 8,\n\
+          \"Ġhello\": 9,\n\
+          \"Ġworld\": 10,\n\
+          \"Ġ##d\" : 11\n\
+        },\n\
+        \"merges\": [\n\
+          \"Ġ h\",\n\
+          \"Ġ w\",\n\
+          \"h e\",\n\
+          \"l l\",\n\
+          \"o w\",\n\
+          \"r l\",\n\
+          \"l d\",\n\
+          \"Ġ ##\",\n\
+          \"## d\"\n\
+        ]\n\
+      },\n\
+      \"normalizer\": {\n\
+        \"type\": \"BertNormalizer\",\n\
+        \"lowercase\": true,\n\
+        \"strip_accents\": true,\n\
+        \"clean_text\": true\n\
+      },\n\
+      \"pre_tokenizer\": {\n\
+        \"type\": \"BertPreTokenizer\"\n\
+      },\n\
+      \"post_processor\": {\n\
+        \"type\": \"BertProcessing\",\n\
+        \"sep\": [\"[SEP]\", 3],\n\
+        \"cls\": [\"[CLS]\", 2]\n\
+      },\n\
+      \"decoder\": {\n\
+        \"type\": \"BPEDecoder\",\n\
+        \"suffix\": \"Ġ\"\n\
+      }\n\
+    }";
 
     // This helper function is defined at the `tests` module level to be shared.
     // It ensures the NamedTempFile lives as long as the TokenizerWrapper instance.
@@ -668,7 +665,7 @@ mod tests {
         match result {
             Err(TokenizerError::DecodingFailed{ ids, source_message }) => {
                 println!("Decoding failed as expected (DecodingFailed): IDs: {:?}, Source: {}", ids, source_message);
-                assert_eq!(ids, &invalid_ids);
+                assert_eq!(ids, invalid_ids); // Removed &
                 // The source_message from tokenizers::Error for invalid ID might be like "TokenId `X` out of vocabulary bounds"
                 assert!(source_message.contains("out of vocabulary bounds") || source_message.contains("invalid id"));
             }

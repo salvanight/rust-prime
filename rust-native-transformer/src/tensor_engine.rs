@@ -10,6 +10,7 @@ pub enum TensorError {
     OutOfBounds(String),
     UnsupportedAxis(String),
     IncompatibleShapes(String), // For operations like matmul
+    UnsupportedOperation(String), // Added for SIMD removal
 }
 
 impl std::fmt::Display for TensorError {
@@ -20,64 +21,50 @@ impl std::fmt::Display for TensorError {
             TensorError::OutOfBounds(s) => write!(f, "Out of bounds: {}", s),
             TensorError::UnsupportedAxis(s) => write!(f, "Unsupported axis: {}", s),
             TensorError::IncompatibleShapes(s) => write!(f, "Incompatible shapes: {}", s),
+            TensorError::UnsupportedOperation(s) => write!(f, "Unsupported operation: {}", s),
         }
     }
 }
 
-// SIMD specific imports
-use std::simd::f32x8; 
-use std::simd::num::SimdFloat;
-use std::simd::StdFloat;
+// SIMD specific imports removed as portable_simd is unstable
+// use std::simd::f32x8;
+// use std::simd::num::SimdFloat;
+// use std::simd::StdFloat;
 
 impl Tensor<f32> {
-    pub fn gelu_simd(&self) -> Result<Tensor<f32>, TensorError> { // Changed to method
-        let mut output_data = vec![0.0f32; self.data.len()]; // Use self
-        let mut k_base = 0;
+    pub fn gelu_simd(&self) -> Result<Tensor<f32>, TensorError> {
+        Err(TensorError::UnsupportedOperation("gelu_simd requires portable_simd feature, which is unstable.".to_string()))
+        // let mut output_data = vec![0.0f32; self.data.len()];
+        // let mut k_base = 0;
 
-        let simd_lanes = f32x8::LEN;
+        // let simd_lanes = 8; // f32x8::LEN;
         
-        // SIMD Constants
-        let simd_half = f32x8::splat(0.5);
-        let simd_one = f32x8::splat(1.0);
-        let simd_inv_sqrt_2 = f32x8::splat(1.0 / std::f32::consts::SQRT_2);
+        // // SIMD Constants
+        // let simd_half = f32x8::splat(0.5);
+        // let simd_one = f32x8::splat(1.0);
+        // let simd_inv_sqrt_2 = f32x8::splat(1.0 / std::f32::consts::SQRT_2);
 
-        while k_base + (simd_lanes - 1) < self.data.len() { // Use self
-            // 1. Load data into an f32x8 vector
-            let x_vec = f32x8::from_slice(&self.data[k_base .. k_base + simd_lanes]); // Use self
-            
-            // 2. Calculate v = x_vec * simd_inv_sqrt_2
-            let v_for_tanh = x_vec * simd_inv_sqrt_2; // Renamed for clarity
-            
-            // 3. Calculate tanh_v = (v_for_tanh.exp() - (-v_for_tanh).exp()) / (v_for_tanh.exp() + (-v_for_tanh).exp())
-            let exp_v = StdFloat::exp(v_for_tanh);
-            let exp_neg_v = StdFloat::exp(-v_for_tanh);
-            let tanh_v = (exp_v - exp_neg_v) / (exp_v + exp_neg_v);
-            
-            // 4. Calculate sum_val = simd_one + tanh_v
-            let sum_val = simd_one + tanh_v;
-            
-            // 5. Calculate mul_val = x_vec * sum_val
-            let mul_val = x_vec * sum_val;
-            
-            // 6. Final result for the chunk: result_vec = simd_half * mul_val
-            let result_vec = simd_half * mul_val;
-            
-            // 7. Store result_vec back into the output data vector
-            result_vec.copy_to_slice(&mut output_data[k_base .. k_base + simd_lanes]);
-            
-            k_base += simd_lanes;
-        }
+        // while k_base + (simd_lanes - 1) < self.data.len() {
+        //     let x_vec = f32x8::from_slice(&self.data[k_base .. k_base + simd_lanes]);
+        //     let v_for_tanh = x_vec * simd_inv_sqrt_2;
+        //     let exp_v = StdFloat::exp(v_for_tanh);
+        //     let exp_neg_v = StdFloat::exp(-v_for_tanh);
+        //     let tanh_v = (exp_v - exp_neg_v) / (exp_v + exp_neg_v);
+        //     let sum_val = simd_one + tanh_v;
+        //     let mul_val = x_vec * sum_val;
+        //     let result_vec = simd_half * mul_val;
+        //     result_vec.copy_to_slice(&mut output_data[k_base .. k_base + simd_lanes]);
+        //     k_base += simd_lanes;
+        // }
 
-        // Handle scalar remainder
-        while k_base < self.data.len() { // Use self
-            let x_val = self.data[k_base]; // Use self
-            let x_f64 = x_val as f64; 
-            let result_f64 = 0.5 * x_f64 * (1.0 + (x_f64 / std::f64::consts::SQRT_2).tanh());
-            output_data[k_base] = result_f64 as f32;
-            k_base += 1;
-        }
-
-        Tensor::new(output_data, self.shape.clone()) // Use self
+        // while k_base < self.data.len() {
+        //     let x_val = self.data[k_base];
+        //     let x_f64 = x_val as f64;
+        //     let result_f64 = 0.5 * x_f64 * (1.0 + (x_f64 / std::f64::consts::SQRT_2).tanh());
+        //     output_data[k_base] = result_f64 as f32;
+        //     k_base += 1;
+        // }
+        // Tensor::new(output_data, self.shape.clone())
     }
 
     pub fn scalar_mul(&self, scalar: f32) -> Result<Tensor<f32>, TensorError> {
@@ -241,58 +228,59 @@ impl Tensor<f32> {
         let common_k = k_a; // K
 
         // 3. Create result tensor `output_data: Vec<f32>` initialized to zeros, shape `[M, N]`
-        let mut output_data = vec![0.0f32; m * n];
+        Err(TensorError::UnsupportedOperation("matmul_simd requires portable_simd feature, which is unstable.".to_string()))
+        // let mut output_data = vec![0.0f32; m * n];
 
-        // 4. Loop i from 0 to M-1 (rows of A / output)
-        for i in 0..m {
-            // 5. Loop j from 0 to N-1 (cols of B / output)
-            for j in 0..n {
-                // 6. Initialize `dot_product_sum = 0.0f32;`
-                let mut dot_product_sum = 0.0f32;
+        // // 4. Loop i from 0 to M-1 (rows of A / output)
+        // for i in 0..m {
+        //     // 5. Loop j from 0 to N-1 (cols of B / output)
+        //     for j in 0..n {
+        //         // 6. Initialize `dot_product_sum = 0.0f32;`
+        //         let mut dot_product_sum = 0.0f32;
                 
-                let mut k_idx = 0;
-                // 7. Loop k_base from 0 to K-1, step 8 (SIMD part for dot product)
-                while k_idx + 7 < common_k {
-                    // 8. Load `a_vec = f32x8::from_slice(&self.data[i*K + k_base .. i*K + k_base + 8]);`
-                    // Offset for row i in A: i * common_k
-                    let a_vec = f32x8::from_slice(&self.data[i * common_k + k_idx .. i * common_k + k_idx + 8]);
+        //         let mut k_idx = 0;
+        //         // 7. Loop k_base from 0 to K-1, step 8 (SIMD part for dot product)
+        //         while k_idx + 7 < common_k {
+        //             // 8. Load `a_vec = f32x8::from_slice(&self.data[i*K + k_base .. i*K + k_base + 8]);`
+        //             // Offset for row i in A: i * common_k
+        //             let a_vec = f32x8::from_slice(&self.data[i * common_k + k_idx .. i * common_k + k_idx + 8]);
 
-                    // 9. Manually construct `b_col_elements: [f32; 8]` by picking `other.data[(k_base+offset)*N + j]`
-                    // This gathers elements from column j of B
-                    let b_col_elements: [f32; 8] = [
-                        other.data[(k_idx + 0) * n + j],
-                        other.data[(k_idx + 1) * n + j],
-                        other.data[(k_idx + 2) * n + j],
-                        other.data[(k_idx + 3) * n + j],
-                        other.data[(k_idx + 4) * n + j],
-                        other.data[(k_idx + 5) * n + j],
-                        other.data[(k_idx + 6) * n + j],
-                        other.data[(k_idx + 7) * n + j],
-                    ];
-                    // 10. Load `b_vec = f32x8::from_array(b_col_elements);`
-                    let b_vec = f32x8::from_array(b_col_elements);
+        //             // 9. Manually construct `b_col_elements: [f32; 8]` by picking `other.data[(k_base+offset)*N + j]`
+        //             // This gathers elements from column j of B
+        //             let b_col_elements: [f32; 8] = [
+        //                 other.data[(k_idx + 0) * n + j],
+        //                 other.data[(k_idx + 1) * n + j],
+        //                 other.data[(k_idx + 2) * n + j],
+        //                 other.data[(k_idx + 3) * n + j],
+        //                 other.data[(k_idx + 4) * n + j],
+        //                 other.data[(k_idx + 5) * n + j],
+        //                 other.data[(k_idx + 6) * n + j],
+        //                 other.data[(k_idx + 7) * n + j],
+        //             ];
+        //             // 10. Load `b_vec = f32x8::from_array(b_col_elements);`
+        //             let b_vec = f32x8::from_array(b_col_elements);
                     
-                    // 11. `dot_product_sum += (a_vec * b_vec).reduce_sum();`
-                    dot_product_sum += <f32x8 as SimdFloat>::reduce_sum(a_vec * b_vec);
+        //             // 11. `dot_product_sum += (a_vec * b_vec).reduce_sum();`
+        //             dot_product_sum += <f32x8 as SimdFloat>::reduce_sum(a_vec * b_vec);
                     
-                    k_idx += 8;
-                }
+        //             k_idx += 8;
+        //         }
 
-                // 12. Handle scalar remainder for k if K % 8 != 0
-                // 13. Loop k_scalar from (K - K % 8) to K-1 (or current k_idx to K-1)
-                while k_idx < common_k {
-                    // 14. `dot_product_sum += self.data[i*K + k_scalar] * other.data[k_scalar*N + j];`
-                    dot_product_sum += self.data[i * common_k + k_idx] * other.data[k_idx * n + j];
-                    k_idx += 1;
-                }
+        //         // 12. Handle scalar remainder for k if K % 8 != 0
+        //         // 13. Loop k_scalar from (K - K % 8) to K-1 (or current k_idx to K-1)
+        //         while k_idx < common_k {
+        //             // 14. `dot_product_sum += self.data[i*K + k_scalar] * other.data[k_scalar*N + j];`
+        //             dot_product_sum += self.data[i * common_k + k_idx] * other.data[k_idx * n + j];
+        //             k_idx += 1;
+        //         }
                 
-                // 15. `output_data[i*N + j] = dot_product_sum;`
-                output_data[i * n + j] = dot_product_sum;
-            }
-        }
+        //         // 15. `output_data[i*N + j] = dot_product_sum;`
+        //         output_data[i * n + j] = dot_product_sum;
+        //     }
+        // }
 
-        // 16. Return Ok(Tensor::new(output_data, vec![M, N])?)
-        Tensor::new(output_data, vec![m, n])
+        // // 16. Return Ok(Tensor::new(output_data, vec![M, N])?)
+        // Tensor::new(output_data, vec![m, n])
     }
 }
 
@@ -914,7 +902,6 @@ mod tests {
         let actual2 = a2.matmul_simd(&b2).unwrap();
         let expected2 = Tensor::matmul(&a2, &b2).unwrap(); // Changed
         let actual2 = Tensor::matmul(&a2, &b2).unwrap();   // Changed from matmul_simd
-        main
         assert_tensors_approx_equal(&actual2, &expected2, FLOAT_TOLERANCE);
 
         // Case 3: Small matrices
@@ -925,7 +912,6 @@ mod tests {
         let actual3 = a3.matmul_simd(&b3).unwrap();
         let expected3 = Tensor::matmul(&a3, &b3).unwrap(); // Changed
         let actual3 = Tensor::matmul(&a3, &b3).unwrap();   // Changed from matmul_simd
-        main
         assert_tensors_approx_equal(&actual3, &expected3, FLOAT_TOLERANCE);
         
         // Case 4: Larger, more arbitrary dimensions
@@ -935,7 +921,6 @@ mod tests {
         let actual4 = a4.matmul_simd(&b4).unwrap();
         let expected4 = Tensor::matmul(&a4, &b4).unwrap(); // Changed
         let actual4 = Tensor::matmul(&a4, &b4).unwrap();   // Changed from matmul_simd
-        main
         assert_tensors_approx_equal(&actual4, &expected4, FLOAT_TOLERANCE);
         
         // Case 5: K = 1 (tests remainder loop primarily)
@@ -945,7 +930,6 @@ mod tests {
         let actual5 = a5.matmul_simd(&b5).unwrap();
         let expected5 = Tensor::matmul(&a5, &b5).unwrap(); // Changed
         let actual5 = Tensor::matmul(&a5, &b5).unwrap();   // Changed from matmul_simd
-        main
         assert_tensors_approx_equal(&actual5, &expected5, FLOAT_TOLERANCE);
 
         // Case 6: K = 8 (tests SIMD loop primarily, no remainder)
@@ -955,7 +939,6 @@ mod tests {
         let actual6 = a6.matmul_simd(&b6).unwrap();
         let expected6 = Tensor::matmul(&a6, &b6).unwrap(); // Changed
         let actual6 = Tensor::matmul(&a6, &b6).unwrap();   // Changed from matmul_simd
-        main
         assert_tensors_approx_equal(&actual6, &expected6, FLOAT_TOLERANCE);
     }
 
