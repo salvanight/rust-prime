@@ -14,7 +14,7 @@ uuid = { version = "1.8", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.10" 
-criterion = "0.5"
+criterion = "0.4.0" # Changed from 0.5
 rand = "0.8" # Ensure rand is present for benchmarks
 
 [[bin]]

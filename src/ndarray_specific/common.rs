@@ -1,36 +1,118 @@
-#![cfg(feature = "ndarray_backend")]
-use ndarray::{ArrayD, IxDyn};
+use crate::accelerator::{CpuTensor, Device, Module, Tensor};
+use std::error::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LayerNorm {
-    // Placeholder fields, e.g., weight, bias
-    // For now, can be empty or use PhantomData if specific dimensions are known later
-    // Or, more simply for a placeholder:
-    _weight: ArrayD<f32>, // Example: Array1<f32> if shape is known
-    _bias: ArrayD<f32>,   // Example: Array1<f32>
+    gamma: CpuTensor<f32>,
+    beta: CpuTensor<f32>,
+    epsilon: f32,
+    device: Device,
 }
 
 impl LayerNorm {
-    pub fn new(/* config: &Config, etc. */) -> Result<Self, Box<dyn std::error::Error>> {
-        // Initialize placeholder weights/biases
-        // For actual initialization, you'd load these from a model file or initialize randomly
-        // For now, let's use empty arrays with dynamic dimensions for placeholders
-        let dummy_weight = ArrayD::zeros(IxDyn(&[0])); // Placeholder
-        let dummy_bias = ArrayD::zeros(IxDyn(&[0]));   // Placeholder
-        
-        Ok(Self { 
-            _weight: dummy_weight,
-            _bias: dummy_bias,
+    pub fn new(
+        gamma_data: &[f32],
+        gamma_shape: &[usize],
+        beta_data: &[f32],
+        beta_shape: &[usize],
+        epsilon: f32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let gamma = CpuTensor::from_data_and_shape(gamma_data, gamma_shape, Device::CPU)?;
+        let beta = CpuTensor::from_data_and_shape(beta_data, beta_shape, Device::CPU)?;
+        Ok(Self {
+            gamma,
+            beta,
+            epsilon,
+            device: Device::CPU,
         })
     }
+}
 
-    pub fn forward(&self, x: &ArrayD<f32>) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
-        // Placeholder for LayerNorm forward pass
-        // Actual implementation would normalize x using self.weight and self.bias
-        println!("LayerNorm forward called with tensor of shape: {:?}", x.shape());
-        // For now, just return a clone or a newly created dummy tensor
-        // Ok(x.clone()) // Simplest placeholder
-        todo!("Implement LayerNorm forward pass");
+impl Module for LayerNorm {
+    type Input = CpuTensor<f32>;
+    type Output = CpuTensor<f32>;
+
+    fn forward(&self, input: Self::Input) -> Result<Self::Output, Box<dyn Error>> {
+        if input.device() != self.device {
+            return Err(format!(
+                "LayerNorm is on {:?} but input is on {:?}",
+                self.device,
+                input.device()
+            )
+            .into());
+        }
+        if self.device != Device::CPU {
+            // This check is somewhat redundant for LayerNorm if gamma/beta are CpuTensor,
+            // but good practice if it could hold other device-specific resources.
+            return Err(format!(
+                "LayerNorm on {:?} is not supported for forward pass, only CPU.",
+                self.device
+            )
+            .into());
+        }
+
+        let x_slice = input.as_slice()?;
+        let gamma_slice = self.gamma.as_slice()?;
+        let beta_slice = self.beta.as_slice()?;
+
+        let input_shape = input.shape();
+        let last_dim_size = *input_shape
+            .last()
+            .ok_or("Input tensor has no dimensions")?;
+
+        if gamma_slice.len() != last_dim_size || beta_slice.len() != last_dim_size {
+            return Err(format!(
+                "Gamma/Beta dimensions ({}, {}) do not match input's last dimension ({})",
+                gamma_slice.len(),
+                beta_slice.len(),
+                last_dim_size
+            )
+            .into());
+        }
+
+        let mut output_data = Vec::with_capacity(x_slice.len());
+
+        for chunk in x_slice.chunks_exact(last_dim_size) {
+            let sum: f32 = chunk.iter().sum();
+            let mean = sum / (last_dim_size as f32);
+
+            let variance_sum: f32 = chunk.iter().map(|val| (val - mean).powi(2)).sum();
+            let variance = variance_sum / (last_dim_size as f32);
+            let inv_std_dev = 1.0 / (variance + self.epsilon).sqrt();
+
+            for (i, val) in chunk.iter().enumerate() {
+                let normalized_val = (val - mean) * inv_std_dev;
+                output_data.push(gamma_slice[i] * normalized_val + beta_slice[i]);
+            }
+        }
+
+        CpuTensor::from_data_and_shape(&output_data, input_shape, self.device.clone())
+    }
+
+    fn to_device(&mut self, device: Device) -> Result<(), Box<dyn Error>> {
+        if self.device == device {
+            return Ok(());
+        }
+        // Since gamma and beta are CpuTensors, they can only be on CPU.
+        // Thus, LayerNorm can only be on CPU.
+        if device != Device::CPU {
+            return Err(format!(
+                "LayerNorm with CpuTensor weights cannot be moved to {:?}. Only CPU is supported.",
+                device
+            )
+            .into());
+        }
+        
+        // Conceptually "move" by ensuring they are on the target device.
+        // For CpuTensor, this only works if the target is CPU.
+        self.gamma = self.gamma.to_device(device.clone())?;
+        self.beta = self.beta.to_device(device.clone())?;
+        self.device = device;
+        Ok(())
+    }
+
+    fn current_device(&self) -> Device {
+        self.device.clone()
     }
 }
 

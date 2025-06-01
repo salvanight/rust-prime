@@ -189,7 +189,7 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
     println!("2: Rejected");
     println!("Any other key to skip/unvalidated.");
 
-    let mut user_feedback_input = String::new();
+    let _user_feedback_input = String::new(); // Prefixed with _ as it's not used after commenting out stdin().read_line()
     // std::io::stdin().read_line(&mut user_feedback_input).map_err(|e| RuntimeError::Io(e))?; // Propagate IO error
 
     // let validation_status = match user_feedback_input.trim() {
