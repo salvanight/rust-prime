@@ -14,6 +14,9 @@ pub mod attention;
 pub mod mlp;
 pub mod model;
 pub mod tokenizer; // This will now load src/tokenizer.rs
+pub mod cache_tier;
+pub mod system_resources;
+pub mod repl_feedback;
 pub mod native;
 #[cfg(feature = "ndarray_backend")]
 pub mod ndarray_specific;
