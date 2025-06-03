@@ -800,6 +800,13 @@ mod tests {
             .expect("Failed to add tokens");
 
         assert_eq!(num_added, tokens_to_add.len());
+6y21qa-codex/add-test-for-add_new_tokens-behavior
+        assert_eq!(
+            wrapper.get_vocab_size(),
+            initial_vocab_size + tokens_to_add.len() as u32
+        );
+=======
         assert_eq!(wrapper.get_vocab_size(), initial_vocab_size + num_added as u32);
+main
     }
 }
