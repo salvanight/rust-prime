@@ -18,13 +18,14 @@ log = "0.4"
 libm = "0.2.8" # For math functions like tanhf in GELU
 
 [features]
-default = []
+default = ["ndarray_backend"]
 tokenizer-debug-logs = []
 ndarray_backend = ["dep:ndarray", "dep:ndarray-stats"]
 
 [[bin]]
 name = "native_cli"
 path = "src/bin/native_cli.rs"
+required-features = ["ndarray_backend"]
 
 [[bin]]
 name = "experimental_repl"
