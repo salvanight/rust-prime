@@ -37,6 +37,9 @@ pub enum TokenizerError {
     DecodingFailed { ids: Vec<u32>, source_message: String },
 }
 
+#[cfg(test)]
+pub use tests::DUMMY_TOKENIZER_JSON;
+
 /// Options for configuring the encoding process, specifically truncation and padding.
 #[derive(Debug, Clone, Default)]
 pub struct EncodeOptions {
@@ -467,6 +470,7 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokenizers::AddedToken; // Required for add_new_tokens test
 
+32s0bh-codex/add-test-for-add_new_tokens-behavior
     // Define a minimal, valid tokenizer JSON used for the unit tests. It keeps
     // the vocabulary intentionally small but still exercises the tokenizer API
     // in a realistic way.
@@ -558,6 +562,61 @@ mod tests {
     // This helper function writes the provided JSON content to a temporary file
     // and returns a `TokenizerWrapper` loaded from that file. It ensures the
     // temporary file remains alive for the duration of each test.
+=======
+    // Define the dummy tokenizer JSON content
+    // This structure is based on typical Hugging Face tokenizer files.
+    pub const DUMMY_TOKENIZER_JSON: &str = "{\n\
+      \"model\": {\n\
+        \"type\": \"BPE\",\n\
+        \"vocab\": {\n\
+          \"[PAD]\": 0,\n\
+          \"[UNK]\": 1,\n\
+          \"[CLS]\": 2,\n\
+          \"[SEP]\": 3,\n\
+          \"[MASK]\": 4,\n\
+          \"hello\": 5,\n\
+          \"world\": 6,\n\
+          \"##d\": 7,\n\
+          \"Ġ\": 8,\n\
+          \"Ġhello\": 9,\n\
+          \"Ġworld\": 10,\n\
+          \"Ġ##d\" : 11\n\
+        },\n\
+        \"merges\": [\n\
+          \"Ġ h\",\n\
+          \"Ġ w\",\n\
+          \"h e\",\n\
+          \"l l\",\n\
+          \"o w\",\n\
+          \"r l\",\n\
+          \"l d\",\n\
+          \"Ġ ##\",\n\
+          \"## d\"\n\
+        ]\n\
+      },\n\
+      \"normalizer\": {\n\
+        \"type\": \"BertNormalizer\",\n\
+        \"lowercase\": true,\n\
+        \"strip_accents\": true,\n\
+        \"clean_text\": true\n\
+      },\n\
+      \"pre_tokenizer\": {\n\
+        \"type\": \"BertPreTokenizer\"\n\
+      },\n\
+      \"post_processor\": {\n\
+        \"type\": \"BertProcessing\",\n\
+        \"sep\": [\"[SEP]\", 3],\n\
+        \"cls\": [\"[CLS]\", 2]\n\
+      },\n\
+      \"decoder\": {\n\
+        \"type\": \"BPEDecoder\",\n\
+        \"suffix\": \"Ġ\"\n\
+      }\n\
+    }";
+
+    // This helper function is defined at the `tests` module level to be shared.
+    // It ensures the NamedTempFile lives as long as the TokenizerWrapper instance.
+main
     fn setup_temp_tokenizer_file_and_wrapper(json_content: &str) -> (NamedTempFile, TokenizerWrapper) {
         let mut temp_file = NamedTempFile::new().expect("Failed to create temporary file for test");
         temp_file
@@ -847,9 +906,18 @@ mod tests {
             .expect("Failed to add tokens");
 
         assert_eq!(num_added, tokens_to_add.len());
+32s0bh-codex/add-test-for-add_new_tokens-behavior
+=======
+6y21qa-codex/add-test-for-add_new_tokens-behavior
+main
         assert_eq!(
             wrapper.get_vocab_size(),
             initial_vocab_size + tokens_to_add.len() as u32
         );
+32s0bh-codex/add-test-for-add_new_tokens-behavior
+=======
+=======
+        assert_eq!(wrapper.get_vocab_size(), initial_vocab_size + num_added as u32);
+main
     }
 }
