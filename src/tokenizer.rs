@@ -780,4 +780,23 @@ mod tests {
         assert!(decode_no_skip_result.is_ok(), "Decoding special IDs (skip=false) failed: {:?}", decode_no_skip_result.err());
         assert_eq!(decode_no_skip_result.unwrap(), DUMMY_SPECIAL_TOKEN_STR_FOR_TESTS, "Decoding special ID [MASK] (skip=false) did not produce expected string.");
     }
+
+    #[test]
+    fn test_add_new_tokens_returns_count_and_increases_vocab() {
+        let (_temp_file, mut wrapper) = setup_temp_tokenizer_file_and_wrapper(DUMMY_TOKENIZER_JSON);
+
+        let initial_vocab_size = wrapper.get_vocab_size();
+
+        let tokens_to_add = vec![
+            AddedToken::from("<NEW_A>", true),
+            AddedToken::from("<NEW_B>", true),
+        ];
+
+        let num_added = wrapper
+            .add_new_tokens(&tokens_to_add)
+            .expect("Failed to add tokens");
+
+        assert_eq!(num_added, tokens_to_add.len());
+        assert_eq!(wrapper.get_vocab_size(), initial_vocab_size + num_added as u32);
+    }
 }
