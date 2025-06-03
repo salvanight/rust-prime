@@ -14,6 +14,9 @@ pub mod attention;
 pub mod mlp;
 pub mod model;
 pub mod tokenizer; // This will now load src/tokenizer.rs
+pub mod native;
+#[cfg(feature = "ndarray_backend")]
+pub mod ndarray_specific;
 
 // Remove the gpt2_tokenizer_tests module from here, as tests should be in their respective files.
 // The tests for TokenizerWrapper are in src/tokenizer.rs.

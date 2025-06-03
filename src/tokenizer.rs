@@ -37,6 +37,9 @@ pub enum TokenizerError {
     DecodingFailed { ids: Vec<u32>, source_message: String },
 }
 
+#[cfg(test)]
+pub use tests::DUMMY_TOKENIZER_JSON;
+
 /// Options for configuring the encoding process, specifically truncation and padding.
 #[derive(Debug, Clone, Default)]
 pub struct EncodeOptions {
@@ -469,7 +472,7 @@ mod tests {
 
     // Define the dummy tokenizer JSON content
     // This structure is based on typical Hugging Face tokenizer files.
-    const DUMMY_TOKENIZER_JSON: &str = "{\n\
+    pub const DUMMY_TOKENIZER_JSON: &str = "{\n\
       \"model\": {\n\
         \"type\": \"BPE\",\n\
         \"vocab\": {\n\
