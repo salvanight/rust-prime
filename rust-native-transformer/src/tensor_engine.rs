@@ -207,28 +207,10 @@ impl Tensor<f32> {
     }
 
     pub fn matmul_simd(&self, other: &Tensor<f32>) -> Result<Tensor<f32>, TensorError> {
-        // 1. Shape checks (self is A, other is B)
-        if self.rank() != 2 || other.rank() != 2 {
-            return Err(TensorError::InvalidDimension(
-                "matmul_simd currently only supports 2D tensors".to_string(),
-            ));
-        }
-
-        let m = self.shape[0]; // Rows of A
-        let k_a = self.shape[1]; // Cols of A / common dimension
-        let k_b = other.shape[0]; // Rows of B / common dimension
-        let n = other.shape[1]; // Cols of B
-
-        if k_a != k_b {
-            return Err(TensorError::IncompatibleShapes(format!(
-                "Incompatible shapes for matmul_simd: A has shape [{}, {}], B has shape [{}, {}]",
-                m, k_a, k_b, n
-            )));
-        }
-        let common_k = k_a; // K
-
-        // 3. Create result tensor `output_data: Vec<f32>` initialized to zeros, shape `[M, N]`
-        Err(TensorError::UnsupportedOperation("matmul_simd requires portable_simd feature, which is unstable.".to_string()))
+        // Until a SIMD version is implemented, fall back to the regular matmul.
+        // This maintains API compatibility without triggering errors on stable
+        // compilers that lack `portable_simd`.
+        Tensor::matmul(self, other)
         // let mut output_data = vec![0.0f32; m * n];
 
         // // 4. Loop i from 0 to M-1 (rows of A / output)
