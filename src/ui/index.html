@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Upload</title>
+</head>
+<body>
+    <h1>Upload Files</h1>
+    <form id="uploadForm" action="/upload" method="post" enctype="multipart/form-data">
+        <input type="file" name="files" multiple>
+        <button type="submit">Upload</button>
+    </form>
+
+    <div id="uploadResults">
+        <!-- Server response will be displayed here -->
+    </div>
+
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async function(event) {
+            event.preventDefault(); // Prevent default form submission
+
+            const formData = new FormData(this);
+            const responseDisplay = document.getElementById('uploadResults');
+            responseDisplay.innerHTML = '<p>Uploading and processing...</p>'; // Show loading message
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                // Regardless of response.ok, try to read the HTML body sent by the server.
+                // The server is configured to send descriptive HTML for both success and error cases.
+                const htmlData = await response.text();
+                responseDisplay.innerHTML = htmlData;
+
+                // Optionally, add specific styling or messages based on response.ok
+                if (!response.ok) {
+                    console.warn('Server responded with an error status:', response.status, response.statusText);
+                    // The htmlData already contains the error details from the server.
+                    // You could add a generic fallback message here if htmlData was empty for some reason,
+                    // but the backend is designed to always send HTML.
+                }
+            } catch (error) {
+                console.error('Error during upload:', error);
+                responseDisplay.innerHTML = `<p>An error occurred: ${error.message}</p>`;
+            }
+        });
+    </script>
+</body>
+</html>

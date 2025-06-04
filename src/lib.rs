@@ -31,3 +31,4 @@ pub mod ndarray_specific;
  main
 
 pub mod tokenizer; // This will now load src/tokenizer.rs
+pub mod ui;
