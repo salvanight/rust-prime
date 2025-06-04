@@ -16,17 +16,15 @@ ndarray-stats = { version = "0.5.1", optional = true } # Added for GatingLayer (
 sysinfo = "0.29.0" # Added for system monitoring
 log = "0.4"
 libm = "0.2.8" # For math functions like tanhf in GELU
-uuid = { version = "1.7.0", features = ["v4"] }
 
 [features]
-default = ["ndarray_backend"]
+default = []
 tokenizer-debug-logs = []
 ndarray_backend = ["dep:ndarray", "dep:ndarray-stats"]
 
 [[bin]]
 name = "native_cli"
 path = "src/bin/native_cli.rs"
-required-features = ["ndarray_backend"]
 
 [[bin]]
 name = "experimental_repl"

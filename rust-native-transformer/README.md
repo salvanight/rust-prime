@@ -9,7 +9,7 @@ A 100% native Rust implementation of a Transformer inference engine, built from 
 *   **Transparency & Introspection:** Aims to provide a clear, understandable, and modifiable Transformer implementation.
 *   **Computational Sovereignty:** Foundational work towards AI systems that are independent of non-Rust ecosystems.
 
-## 🚀 Project Status (Phase 1 - Minimum Viable Product)
+## 🚀 Project Status (Phase 1 - Minima Viable Product)
 
 This project has successfully completed its first phase, delivering a minimally viable GPT-2 inference engine capable of:
 
