@@ -1,6 +1,6 @@
 // src/transformer_core.rs
 
-use super::tensor_engine::{Tensor, TensorError};
+use crate::tensor_engine::{Tensor, TensorError};
 use std::collections::HashMap;
 use rayon::prelude::*;
 use std::sync::Arc;

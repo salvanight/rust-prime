@@ -58,7 +58,7 @@ impl MultiHeadAttention {
         &self,
         hidden_states: &ArrayD<f32>,
         attention_mask: Option<&ArrayD<f32>>,
-        mut layer_kv_cache: Option<&mut LayerKVCache>,
+        layer_kv_cache: Option<&mut LayerKVCache>,
     ) -> Result<ArrayD<f32>, Box<dyn Error>> {
         let initial_shape = hidden_states.shape();
         if initial_shape.len() != 3 {
@@ -98,7 +98,7 @@ impl MultiHeadAttention {
             .map_err(|e: ShapeError| format!("Error reshaping Q: {}", e.to_string()))?
             .permuted_axes([0, 2, 1, 3]);
 
-        let (k_split, v_split, seq_len_kv) = if let Some(cache) = layer_kv_cache.as_mut() {
+        let (k_split, v_split, seq_len_kv) = if let Some(cache) = layer_kv_cache {
             let mut k_head_list = Vec::with_capacity(self.n_head as usize);
             let mut v_head_list = Vec::with_capacity(self.n_head as usize);
             let mut current_max_kv_len = 0;

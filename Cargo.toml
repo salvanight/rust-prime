@@ -20,15 +20,15 @@ uuid = { version = "1.7.0", features = ["v4"] }
 actix-web = "4"
 actix-files = "0.6"
 
+
 [features]
-default = ["ndarray_backend"]
+default = []
 tokenizer-debug-logs = []
 ndarray_backend = ["dep:ndarray", "dep:ndarray-stats"]
 
 [[bin]]
 name = "native_cli"
 path = "src/bin/native_cli.rs"
-required-features = ["ndarray_backend"]
 
 [[bin]]
 name = "experimental_repl"
