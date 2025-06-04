@@ -25,62 +25,6 @@ impl std::fmt::Display for TensorError {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn matmul_micro_kernel_avx2(
-    packed_a: &[f32],         // Packed A block (row-major, conceptual shape current_block_m x current_block_k, actual stride MATMUL_BLOCK_K)
-    packed_b_t: &[f32],     // Packed B^T block (row-major, conceptual shape current_block_n x current_block_k, actual stride MATMUL_BLOCK_K)
-    c_data: &mut [f32],     // Full C matrix data slice
-    current_block_m: usize, // Actual rows in packed_a to process for C sub-block
-    current_block_n: usize, // Actual rows in packed_b_t to process for C sub-block (cols of C)
-    current_block_k: usize, // Common K dimension for these packed blocks
-    row_offset_c: usize,      // Starting row in main C matrix for this C sub-block
-    col_offset_c: usize,      // Starting col in main C matrix for this C sub-block
-    n_dim_orig_c: usize       // Stride (total columns) of the main C matrix
-) {
-    // This micro-kernel computes C_sub[m,n] += sum_k A_sub[m,k] * B_T_sub[n,k]
-    // where A_sub is current_block_m x current_block_k from packed_a
-    // and B_T_sub is current_block_n x current_block_k from packed_b_t.
-    // The SIMD acceleration is applied to the dot product over current_block_k.
-
-    for m_idx in 0..current_block_m { // Iterate over rows of the C sub-block (and rows of packed_a)
-        for n_idx in 0..current_block_n { // Iterate over columns of the C sub-block (and rows of packed_b_t)
-
-            // Pointer to the start of row m_idx in packed_a
-            let a_row_start_ptr = packed_a.as_ptr().add(m_idx * MATMUL_BLOCK_K);
-            // Pointer to the start of row n_idx in packed_b_t
-            // (packed_b_t stores rows of B_T, MATMUL_BLOCK_K is the stride for these rows)
-            let b_t_row_start_ptr = packed_b_t.as_ptr().add(n_idx * MATMUL_BLOCK_K);
-
-            let mut sum_vec = _mm256_setzero_ps();
-            let mut k_sidx = 0;
-
-            // SIMD loop for dot product over K dimension
-            // Processes current_block_k elements
-            while k_sidx + 7 < current_block_k {
-                let a_vec = _mm256_loadu_ps(a_row_start_ptr.add(k_sidx));
-                let b_t_vec = _mm256_loadu_ps(b_t_row_start_ptr.add(k_sidx));
-                sum_vec = _mm256_fmadd_ps(a_vec, b_t_vec, sum_vec);
-                k_sidx += 8;
-            }
-
-            // Horizontal sum of the accumulator vector
-            let mut dot_product_result = horizontal_sum_m256(sum_vec);
-
-            // Scalar remainder loop for K dimension
-            while k_sidx < current_block_k {
-                dot_product_result += (*a_row_start_ptr.add(k_sidx)) * (*b_t_row_start_ptr.add(k_sidx));
-                k_sidx += 1;
-            }
-
-            // Add the computed dot product to the corresponding element in C
-            // Note: This is an accumulating add (+=) because different K-blocks
-            // (from the outer blocking strategy) contribute to the same C elements.
-            let c_flat_idx = (row_offset_c + m_idx) * n_dim_orig_c + (col_offset_c + n_idx);
-            *c_data.get_unchecked_mut(c_flat_idx) += dot_product_result;
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
 unsafe fn pack_b_transposed_block(
     b_t_data: &[f32],       // Original B^T matrix data (row-major for B^T)
                             // B^T has logical dimensions [n_dim_orig, k_dim_orig]
@@ -324,7 +268,7 @@ unsafe fn pack_a_block(
     }
 }
 
-// SIMD Helper functions
+// SIMD Helper functions (Continued)
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn tanhf_approx_avx2(x: __m256) -> __m256 {
@@ -512,41 +456,70 @@ unsafe fn gelu_avx2(data_slice: &mut [f32]) {
 #[cfg(target_arch = "x86_64")]
 unsafe fn matmul_2d_avx2_fma(
     a_data: &[f32],
-    b_transposed_data: &[f32], // Expects B to be transposed [n_dim, k_dim]
+    b_transposed_data: &[f32], // B is already transposed (shape [n_dim, k_dim])
     m: usize,
-    k_dim: usize,
+    k_dim: usize, // Common dimension K
     n_dim: usize,
-    c_data: &mut [f32]
+    c_data: &mut [f32], // Output C matrix data (shape [m, n_dim])
 ) {
-    let lanes = 8;
-    for i in 0..m {
-        for j in 0..n_dim {
-            let mut sum_val = 0.0f32;
-            let mut k_sidx = 0;
-            if k_dim >= lanes {
-                let mut sum_simd_acc = _mm256_setzero_ps();
-                while k_sidx + lanes <= k_dim {
-                    let a_ptr = a_data.as_ptr().add(i * k_dim + k_sidx);
-                    let a_vec = _mm256_loadu_ps(a_ptr);
+    // Assumes c_data is already zeroed out by the caller (e.g., Tensor::matmul)
 
-                    // Load from B_transposed: B_T[j, k_sidx]
-                    // This corresponds to B[k_sidx, j] from original B
-                    // Data from j-th row of B_transposed is contiguous.
-                    let b_vec = _mm256_loadu_ps(b_transposed_data.as_ptr().add(j * k_dim + k_sidx));
+    let mut n_c = 0; // Start of current N-block (iterates over columns of C / rows of B^T)
+    while n_c < n_dim {
+        let current_block_n = std::cmp::min(MATMUL_BLOCK_N, n_dim - n_c);
 
-                    sum_simd_acc = _mm256_fmadd_ps(a_vec, b_vec, sum_simd_acc);
-                    k_sidx += lanes;
-                }
-                sum_val += horizontal_sum_m256(sum_simd_acc);
-            }
-            // Scalar loop for remaining elements in k_dim
-            for k_rem_idx in k_sidx..k_dim {
-                sum_val += *a_data.get_unchecked(i * k_dim + k_rem_idx) *
-                           *b_transposed_data.get_unchecked(j * k_dim + k_rem_idx);
-            }
-            *c_data.get_unchecked_mut(i * n_dim + j) = sum_val;
-        }
-    }
+        let mut k_c = 0; // Start of current K-block (iterates over the common K dimension)
+        while k_c < k_dim {
+            let current_block_k = std::cmp::min(MATMUL_BLOCK_K, k_dim - k_c);
+
+            // Allocate buffer for the packed block of B^T.
+            // Size is fixed by MATMUL_BLOCK_N and MATMUL_BLOCK_K for the buffer.
+            // The actual data packed is current_block_n x current_block_k.
+            let mut packed_b_t_buffer = vec![0.0f32; MATMUL_BLOCK_N * MATMUL_BLOCK_K];
+            pack_b_transposed_block(
+                b_transposed_data,
+                n_c,                // n_start (row start in B^T)
+                k_c,                // k_start (col start in B^T)
+                k_dim,              // k_dim_orig for B^T (stride of B^T, which is its number of columns = original k_dim)
+                current_block_n,    // actual rows to pack from B^T
+                current_block_k,    // actual columns to pack from B^T
+                &mut packed_b_t_buffer,
+            );
+
+            let mut m_c = 0; // Start of current M-block (iterates over rows of C / rows of A)
+            while m_c < m {
+                let current_block_m = std::cmp::min(MATMUL_BLOCK_M, m - m_c);
+
+                // Allocate buffer for the packed block of A.
+                // Size is fixed by MATMUL_BLOCK_M and MATMUL_BLOCK_K.
+                let mut packed_a_buffer = vec![0.0f32; MATMUL_BLOCK_M * MATMUL_BLOCK_K];
+                pack_a_block(
+                    a_data,
+                    m_c,                // m_start (row start in A)
+                    k_c,                // k_start (col start in A)
+                    k_dim,              // k_dim_orig for A (stride of A, which is its number of columns = k_dim)
+                    current_block_m,    // actual rows to pack from A
+                    current_block_k,    // actual columns to pack from A
+                    &mut packed_a_buffer,
+                );
+
+                matmul_micro_kernel_avx2(
+                    &packed_a_buffer,
+                    &packed_b_t_buffer,
+                    c_data,
+                    current_block_m,    // current rows in A_block and C_sub_block
+                    current_block_n,    // current columns in C_sub_block (rows in B_T_block)
+                    current_block_k,    // current common K dimension for this pass
+                    m_c,                // row_offset_c (start row of C_sub_block in main C)
+                    n_c,                // col_offset_c (start col of C_sub_block in main C)
+                    n_dim,              // n_dim_orig_c (total columns/stride of main C matrix)
+                );
+                m_c += MATMUL_BLOCK_M;
+            } // end m_c loop (rows of A and C)
+            k_c += MATMUL_BLOCK_K;
+        } // end k_c loop (common K dimension)
+        n_c += MATMUL_BLOCK_N;
+    } // end n_c loop (columns of C / rows of B^T)
 }
 
 impl Tensor<f32> {
@@ -771,7 +744,7 @@ impl Tensor<f32> {
         let mut md_indices = vec![0; self.rank()];
         let mut current_outer = outer_idx;
         for d_rev_idx in 0..axis {
-            let d = axis - 1 - d_rev_idx;
+            let d = axis - 1 - d_idx_rev;
             md_indices[d] = current_outer % self.shape[d];
             current_outer /= self.shape[d];
         }
@@ -1182,5 +1155,7 @@ mod tests {
         }
     }
 }
+
+[end of rust-native-transformer/tensor_core_optimized/src/lib.rs]
 
 [end of rust-native-transformer/tensor_core_optimized/src/lib.rs]
