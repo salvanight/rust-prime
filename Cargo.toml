@@ -26,6 +26,7 @@ ndarray_backend = ["dep:ndarray", "dep:ndarray-stats"]
 [[bin]]
 name = "native_cli"
 path = "src/bin/native_cli.rs"
+required-features = ["ndarray_backend"]
 
 [[bin]]
 name = "experimental_repl"

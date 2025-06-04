@@ -361,13 +361,9 @@ mod tests {
         TransformerBlock::new(config).expect("Failed to create TransformerBlock for testing")
     }
 
-    // Helper to create GPT2Model for testing
-    // Note: GPT2Model::new now requires wte_data and wpe_data.
-    // We need to provide dummy data for these.
+    // Helper to create GPT2Model for testing using the default constructor
     fn test_gpt2_model(config: &GPT2Config) -> GPT2Model {
-        let wte_data = vec![0.0f32; (config.vocab_size * config.n_embd) as usize];
-        let wpe_data = vec![0.0f32; (config.n_positions * config.n_embd) as usize];
-        GPT2Model::new(config, &wte_data, &wpe_data).expect("Failed to create GPT2Model for testing")
+        GPT2Model::new(config).expect("Failed to create GPT2Model for testing")
     }
 
     #[test]
