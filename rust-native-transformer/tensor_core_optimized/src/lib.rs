@@ -24,6 +24,46 @@ impl std::fmt::Display for TensorError {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+unsafe fn pack_b_transposed_block(
+    b_t_data: &[f32],       // Original B^T matrix data (row-major for B^T)
+                            // B^T has logical dimensions [n_dim_orig, k_dim_orig]
+    n_start: usize,         // Starting row in B^T for the current block (corresponds to original B's column index)
+    k_start: usize,         // Starting col in B^T for the current block (corresponds to original B's row index / K dimension)
+    k_dim_orig: usize,      // Total columns in B^T (which is k_dim, the common dimension, and stride for B^T)
+    current_block_n: usize, // Number of rows to pack from B^T for this block (<= MATMUL_BLOCK_N)
+    current_block_k: usize, // Number of columns to pack from B^T for this block (<= MATMUL_BLOCK_K)
+    packed_b_t: &mut [f32]  // Output buffer, assumed to be MATMUL_BLOCK_N * MATMUL_BLOCK_K
+) {
+    // packed_b_t is expected to be pre-allocated to MATMUL_BLOCK_N * MATMUL_BLOCK_K.
+    // This implementation will pack the block of B^T in a row-major fashion within packed_b_t.
+
+    // 1. Zero out the packed_b_t buffer to handle padding.
+    for val_idx in 0..packed_b_t.len() { // Iterate up to the full capacity
+        *packed_b_t.get_unchecked_mut(val_idx) = 0.0f32;
+    }
+
+    // 2. Copy the relevant block from b_t_data to the top-left of packed_b_t.
+    // The packed buffer `packed_b_t` is treated as having MATMUL_BLOCK_N rows
+    // and MATMUL_BLOCK_K columns (its stride is MATMUL_BLOCK_K).
+    for r_idx_block in 0..current_block_n { // Iterate through rows of the sub-block from B^T
+        for k_idx_block in 0..current_block_k { // Iterate through columns of the sub-block from B^T
+
+            // Calculate source index from original b_t_data (which is row-major for B^T)
+            let src_row_orig_bt = n_start + r_idx_block;
+            let src_col_orig_bt = k_start + k_idx_block;
+            // k_dim_orig is the number of columns in B^T (original K dimension)
+            let src_flat_idx = src_row_orig_bt * k_dim_orig + src_col_orig_bt;
+
+            // Calculate destination index in packed_b_t (row-major)
+            // The stride of packed_b_t is MATMUL_BLOCK_K.
+            let dest_flat_idx = r_idx_block * MATMUL_BLOCK_K + k_idx_block;
+
+            *packed_b_t.get_unchecked_mut(dest_flat_idx) = *b_t_data.get_unchecked(src_flat_idx);
+        }
+    }
+}
+
 impl std::error::Error for TensorError {}
 
 // Tensor Struct Definition
@@ -119,10 +159,10 @@ impl<T> Tensor<T> {
         }
         self.data.get_mut(flat_idx).ok_or_else(|| TensorError::OutOfBounds(format!("Calculated flat index {} out of bounds for data length {} (mut access)", flat_idx, self.data.len())))
     }
+}
 
-    pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self, TensorError>
-    where T: Clone
-    {
+impl<T: Clone> Tensor<T> {
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self, TensorError> {
         let current_num_elements = self.num_elements();
         let new_num_elements: usize = if new_shape.is_empty() {1} else if new_shape.iter().any(|&d| d==0) {0} else {new_shape.iter().product()};
         if current_num_elements != new_num_elements {
@@ -133,7 +173,32 @@ impl<T> Tensor<T> {
         }
         Ok(Tensor { data: self.data.clone(), shape: new_shape })
     }
+
+    pub fn transpose(&self) -> Result<Tensor<T>, TensorError> {
+        if self.rank() != 2 {
+            return Err(TensorError::InvalidDimension(
+                "Transpose operation only supports 2D tensors.".to_string(),
+            ));
+        }
+
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+        let new_shape = vec![cols, rows];
+
+        if self.num_elements() == 0 {
+            return Tensor::new(Vec::new(), new_shape);
+        }
+
+        let mut new_data = Vec::with_capacity(self.data.len());
+        for j_new_row in 0..cols {
+            for i_new_col in 0..rows {
+                new_data.push(self.data[i_new_col * cols + j_new_row].clone());
+            }
+        }
+        Tensor::new(new_data, new_shape)
+    }
 }
+
 
 impl<T: Default + Clone> Tensor<T> {
     pub fn zeros(shape: Vec<usize>) -> Result<Self, TensorError> {
@@ -147,7 +212,63 @@ impl<T: Default + Clone> Tensor<T> {
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-// SIMD Helper functions
+// Define block sizes for cache-aware matmul
+// These values are initial estimates and would typically require tuning
+// for optimal performance on specific target architectures.
+
+// MATMUL_BLOCK_M: Block size for the M dimension (rows of A, rows of C).
+// Chosen to be a multiple of a potential register unroll factor for M.
+const MATMUL_BLOCK_M: usize = 32; // Example value
+
+// MATMUL_BLOCK_K: Block size for the K dimension (common dimension).
+// This block is iterated through completely for each C_block.
+const MATMUL_BLOCK_K: usize = 64; // Example value
+
+// MATMUL_BLOCK_N: Block size for the N dimension (cols of B / C).
+// Should ideally be a multiple of SIMD vector width (8 for f32 AVX2)
+// times any unrolling factor for N in the micro-kernel (e.g., 3 * 8 = 24).
+const MATMUL_BLOCK_N: usize = 24; // Example value
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn pack_a_block(
+    a_data: &[f32],         // Original A matrix data (row-major)
+    m_start: usize,         // Starting row in original A for the current block
+    k_start: usize,         // Starting col in original A for the current block
+    k_dim_orig: usize,      // Total columns in original A (stride for A)
+    current_block_m: usize, // Number of rows to pack for this block (<= MATMUL_BLOCK_M)
+    current_block_k: usize, // Number of columns to pack for this block (<= MATMUL_BLOCK_K)
+    packed_a: &mut [f32]    // Output buffer, assumed to be MATMUL_BLOCK_M * MATMUL_BLOCK_K
+) {
+    // packed_a is expected to be pre-allocated to MATMUL_BLOCK_M * MATMUL_BLOCK_K.
+    // This implementation will pack matrix A's block in a row-major fashion within packed_a.
+
+    // 1. Zero out the packed_a buffer. This handles padding for edge blocks
+    //    where current_block_m < MATMUL_BLOCK_M or current_block_k < MATMUL_BLOCK_K.
+    for val_idx in 0..packed_a.len() { // Iterate up to the full capacity of packed_a
+        *packed_a.get_unchecked_mut(val_idx) = 0.0f32;
+    }
+
+    // 2. Copy the relevant block from a_data to the top-left of packed_a.
+    // The packed buffer `packed_a` is treated as having dimensions MATMUL_BLOCK_M rows
+    // and MATMUL_BLOCK_K columns for the purpose of indexing (its stride is MATMUL_BLOCK_K).
+    for r_idx_block in 0..current_block_m { // Iterate through rows of the sub-block to be copied
+        for k_idx_block in 0..current_block_k { // Iterate through columns of the sub-block
+
+            // Calculate source index from original a_data (which is row-major)
+            let src_row_orig = m_start + r_idx_block;
+            let src_col_orig = k_start + k_idx_block;
+            let src_flat_idx = src_row_orig * k_dim_orig + src_col_orig;
+
+            // Calculate destination index in packed_a (also row-major for this packing strategy)
+            // The stride of packed_a is MATMUL_BLOCK_K.
+            let dest_flat_idx = r_idx_block * MATMUL_BLOCK_K + k_idx_block;
+
+            *packed_a.get_unchecked_mut(dest_flat_idx) = *a_data.get_unchecked(src_flat_idx);
+        }
+    }
+}
+
+// SIMD Helper functions (Continued)
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn tanhf_approx_avx2(x: __m256) -> __m256 {
@@ -335,42 +456,70 @@ unsafe fn gelu_avx2(data_slice: &mut [f32]) {
 #[cfg(target_arch = "x86_64")]
 unsafe fn matmul_2d_avx2_fma(
     a_data: &[f32],
-    b_data: &[f32],
+    b_transposed_data: &[f32], // B is already transposed (shape [n_dim, k_dim])
     m: usize,
-    k_dim: usize,
+    k_dim: usize, // Common dimension K
     n_dim: usize,
-    c_data: &mut [f32]
+    c_data: &mut [f32], // Output C matrix data (shape [m, n_dim])
 ) {
-    let lanes = 8;
-    for i in 0..m {
-        for j in 0..n_dim {
-            let mut sum_val = 0.0f32;
-            let mut k_sidx = 0;
-            if k_dim >= lanes {
-                let mut sum_simd_acc = _mm256_setzero_ps();
-                while k_sidx + lanes <= k_dim {
-                    let a_ptr = a_data.as_ptr().add(i * k_dim + k_sidx);
-                    let a_vec = _mm256_loadu_ps(a_ptr);
-                    let b_val7 = *b_data.get_unchecked((k_sidx + 7) * n_dim + j);
-                    let b_val6 = *b_data.get_unchecked((k_sidx + 6) * n_dim + j);
-                    let b_val5 = *b_data.get_unchecked((k_sidx + 5) * n_dim + j);
-                    let b_val4 = *b_data.get_unchecked((k_sidx + 4) * n_dim + j);
-                    let b_val3 = *b_data.get_unchecked((k_sidx + 3) * n_dim + j);
-                    let b_val2 = *b_data.get_unchecked((k_sidx + 2) * n_dim + j);
-                    let b_val1 = *b_data.get_unchecked((k_sidx + 1) * n_dim + j);
-                    let b_val0 = *b_data.get_unchecked(k_sidx * n_dim + j);
-                    let b_vec = _mm256_set_ps(b_val7, b_val6, b_val5, b_val4, b_val3, b_val2, b_val1, b_val0);
-                    sum_simd_acc = _mm256_fmadd_ps(a_vec, b_vec, sum_simd_acc);
-                    k_sidx += lanes;
-                }
-                sum_val += horizontal_sum_m256(sum_simd_acc);
-            }
-            for k_rem_idx in k_sidx..k_dim {
-                sum_val += *a_data.get_unchecked(i * k_dim + k_rem_idx) * *b_data.get_unchecked(k_rem_idx * n_dim + j);
-            }
-            *c_data.get_unchecked_mut(i * n_dim + j) = sum_val;
-        }
-    }
+    // Assumes c_data is already zeroed out by the caller (e.g., Tensor::matmul)
+
+    let mut n_c = 0; // Start of current N-block (iterates over columns of C / rows of B^T)
+    while n_c < n_dim {
+        let current_block_n = std::cmp::min(MATMUL_BLOCK_N, n_dim - n_c);
+
+        let mut k_c = 0; // Start of current K-block (iterates over the common K dimension)
+        while k_c < k_dim {
+            let current_block_k = std::cmp::min(MATMUL_BLOCK_K, k_dim - k_c);
+
+            // Allocate buffer for the packed block of B^T.
+            // Size is fixed by MATMUL_BLOCK_N and MATMUL_BLOCK_K for the buffer.
+            // The actual data packed is current_block_n x current_block_k.
+            let mut packed_b_t_buffer = vec![0.0f32; MATMUL_BLOCK_N * MATMUL_BLOCK_K];
+            pack_b_transposed_block(
+                b_transposed_data,
+                n_c,                // n_start (row start in B^T)
+                k_c,                // k_start (col start in B^T)
+                k_dim,              // k_dim_orig for B^T (stride of B^T, which is its number of columns = original k_dim)
+                current_block_n,    // actual rows to pack from B^T
+                current_block_k,    // actual columns to pack from B^T
+                &mut packed_b_t_buffer,
+            );
+
+            let mut m_c = 0; // Start of current M-block (iterates over rows of C / rows of A)
+            while m_c < m {
+                let current_block_m = std::cmp::min(MATMUL_BLOCK_M, m - m_c);
+
+                // Allocate buffer for the packed block of A.
+                // Size is fixed by MATMUL_BLOCK_M and MATMUL_BLOCK_K.
+                let mut packed_a_buffer = vec![0.0f32; MATMUL_BLOCK_M * MATMUL_BLOCK_K];
+                pack_a_block(
+                    a_data,
+                    m_c,                // m_start (row start in A)
+                    k_c,                // k_start (col start in A)
+                    k_dim,              // k_dim_orig for A (stride of A, which is its number of columns = k_dim)
+                    current_block_m,    // actual rows to pack from A
+                    current_block_k,    // actual columns to pack from A
+                    &mut packed_a_buffer,
+                );
+
+                matmul_micro_kernel_avx2(
+                    &packed_a_buffer,
+                    &packed_b_t_buffer,
+                    c_data,
+                    current_block_m,    // current rows in A_block and C_sub_block
+                    current_block_n,    // current columns in C_sub_block (rows in B_T_block)
+                    current_block_k,    // current common K dimension for this pass
+                    m_c,                // row_offset_c (start row of C_sub_block in main C)
+                    n_c,                // col_offset_c (start col of C_sub_block in main C)
+                    n_dim,              // n_dim_orig_c (total columns/stride of main C matrix)
+                );
+                m_c += MATMUL_BLOCK_M;
+            } // end m_c loop (rows of A and C)
+            k_c += MATMUL_BLOCK_K;
+        } // end k_c loop (common K dimension)
+        n_c += MATMUL_BLOCK_N;
+    } // end n_c loop (columns of C / rows of B^T)
 }
 
 impl Tensor<f32> {
@@ -440,37 +589,20 @@ impl Tensor<f32> {
                 let current_tensor_axis_dim = t_ref.shape[axis];
                 let current_tensor_inner_dims_product: usize = t_ref.shape[axis+1..].iter().product();
                 for axis_el_idx in 0..current_tensor_axis_dim {
-                    let mut current_input_flat_idx = 0; // To be correctly calculated
-                    // Simplified calculation for current_input_flat_idx (assumes outer_idx is correctly flattened for t_ref's prefix)
-                    // This part of concat logic was identified as potentially problematic before and might need full review.
-                    // For now, using the prior version's calculation which was:
-                     let mut temp_outer_idx = outer_idx; // This calculation is for first_tensor's strides
-                     for d_rev_idx in 0..axis {
-                         let d = axis - 1 - d_idx_rev;
-                         // This calculation of current_input_flat_idx within the loop seems incorrect
-                         // as it re-calculates from scratch for each axis_el_idx and t_ref.
-                         // A correct calculation would determine the starting block based on outer_idx
-                         // and then iterate axis_el_idx for the current t_ref.
-                         // The logic from the provided code was:
-                         // current_input_flat_idx += (temp_outer_idx % first_tensor.shape[d]) * first_tensor_strides[d];
-                         // temp_outer_idx /= first_tensor.shape[d];
-                     }
-                     // Re-evaluating the slice calculation logic for concat:
-                     // We need to map the multi-dimensional outer_idx to a flat starting point for the outer block.
-                     // Then, for each tensor t_ref, iterate its contribution along the axis.
-                     // The original logic for current_input_flat_idx inside the innermost loop was flawed.
-                     // A more robust way is to calculate the starting point of the slab for the current t_ref and outer_idx.
-
-                    let mut start_offset_in_t_ref = 0;
-                    let mut_temp_outer_idx_for_t_ref = outer_idx;
-                    let mut t_ref_multiplier = t_ref.num_elements();
-
-                    for d_idx in 0..axis {
-                        t_ref_multiplier /= t_ref.shape[d_idx];
-                        start_offset_in_t_ref += (mut_temp_outer_idx_for_t_ref % t_ref.shape[d_idx]) * t_ref_multiplier;
-                         mut_temp_outer_idx_for_t_ref /= t_ref.shape[d_idx];
+                    let mut current_input_flat_idx = 0;
+                    let mut temp_outer_idx = outer_idx;
+                     // This logic calculates the offset due to dimensions *before* the concatenation axis,
+                     // using the strides of the *first_tensor* as a reference for those dimensions,
+                     // which is valid because non-axis dimensions must match across all tensors.
+                    for d_rev_idx in 0..axis {
+                        let d = axis - 1 - d_idx_rev;
+                        current_input_flat_idx += (temp_outer_idx % first_tensor.shape[d]) * first_tensor_strides[d];
+                        temp_outer_idx /= first_tensor.shape[d];
                     }
-                     current_input_flat_idx = start_offset_in_t_ref + axis_el_idx * current_tensor_inner_dims_product;
+                    // Now, add offset from the concatenation axis itself for the current tensor `t_ref`
+                    // and the specific slice `axis_el_idx` along that axis.
+                    // The number of elements per "row" along the concat axis in `t_ref` is `current_tensor_inner_dims_product`.
+                    current_input_flat_idx += axis_el_idx * current_tensor_inner_dims_product;
 
 
                     if t_ref.data.is_empty() && current_tensor_inner_dims_product > 0 {
@@ -521,10 +653,14 @@ impl Tensor<f32> {
            is_x86_feature_detected!("fma") &&
            m > 0 && k_a > 0 && n > 0
         {
+            // Transpose B for the SIMD kernel
+            let b_transposed = b.transpose()?;
             unsafe {
-                matmul_2d_avx2_fma(&a.data, &b.data, m, k_a, n, &mut result_data);
+                // Pass b_transposed.data to the AVX2 kernel
+                matmul_2d_avx2_fma(&a.data, &b_transposed.data, m, k_a, n, &mut result_data);
             }
         } else if m > 0 && k_a > 0 && n > 0 {
+            // Scalar path
             for i_idx in 0..m {
                 for j_idx in 0..n {
                     let mut sum = 0.0;
@@ -535,6 +671,7 @@ impl Tensor<f32> {
                 }
             }
         }
+        // If m, n, or k_a is 0, result_data will be empty or loops won't run, which is correct.
         Tensor::new(result_data, vec![m, n])
     }
 
@@ -607,7 +744,7 @@ impl Tensor<f32> {
         let mut md_indices = vec![0; self.rank()];
         let mut current_outer = outer_idx;
         for d_rev_idx in 0..axis {
-            let d = axis - 1 - d_rev_idx;
+            let d = axis - 1 - d_idx_rev;
             md_indices[d] = current_outer % self.shape[d];
             current_outer /= self.shape[d];
         }
@@ -713,7 +850,7 @@ mod tests {
 
     fn create_random_tensor(shape: Vec<usize>, seed: u64) -> Tensor<f32> {
         let mut rng = StdRng::seed_from_u64(seed);
-        let num_elements = if shape.is_empty() {1} else {shape.iter().filter(|&&d| d != 0).product()}; // product can be 0 if a dim is 0
+        let num_elements = if shape.is_empty() {1} else {shape.iter().filter(|&&d| d != 0).product()};
         let data = (0..num_elements).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
         Tensor::new(data, shape).unwrap()
     }
@@ -829,6 +966,42 @@ mod tests {
             _ => panic!("Unexpected error type for reshape incompatibility"),
         }
     }
+     #[test]
+    fn test_tensor_transpose() {
+        let t1 = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+        let t1_transposed = t1.transpose().unwrap();
+        assert_eq!(t1_transposed.shape, vec![3, 2]);
+        assert_eq!(t1_transposed.data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+
+        let t2 = Tensor::new(vec![1.0, 2.0, 3.0], vec![3, 1]).unwrap();
+        let t2_transposed = t2.transpose().unwrap();
+        assert_eq!(t2_transposed.shape, vec![1, 3]);
+        assert_eq!(t2_transposed.data, vec![1.0, 2.0, 3.0]);
+
+        let t3 = Tensor::new(vec![1.0, 2.0, 3.0], vec![1, 3]).unwrap();
+        let t3_transposed = t3.transpose().unwrap();
+        assert_eq!(t3_transposed.shape, vec![3, 1]);
+        assert_eq!(t3_transposed.data, vec![1.0, 2.0, 3.0]);
+
+        let t4_empty_data_valid_shape = Tensor::new(Vec::<f32>::new(), vec![0,3]).unwrap();
+        let t4_transposed = t4_empty_data_valid_shape.transpose().unwrap();
+        assert_eq!(t4_transposed.shape, vec![3,0]);
+        assert!(t4_transposed.data.is_empty());
+
+        let t5_empty_data_zero_shape = Tensor::new(Vec::<f32>::new(), vec![0,0]).unwrap();
+        let t5_transposed = t5_empty_data_zero_shape.transpose().unwrap();
+        assert_eq!(t5_transposed.shape, vec![0,0]);
+        assert!(t5_transposed.data.is_empty());
+    }
+
+    #[test]
+    fn test_transpose_invalid_dim() {
+        let t_1d = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+        assert!(t_1d.transpose().is_err());
+        let t_3d = Tensor::new(vec![1.0; 8], vec![2,2,2]).unwrap();
+        assert!(t_3d.transpose().is_err());
+    }
+
 
     #[test]
     fn test_matmul_2x2_2x2() {
@@ -982,3 +1155,7 @@ mod tests {
         }
     }
 }
+
+[end of rust-native-transformer/tensor_core_optimized/src/lib.rs]
+
+[end of rust-native-transformer/tensor_core_optimized/src/lib.rs]
