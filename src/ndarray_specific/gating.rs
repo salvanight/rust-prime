@@ -110,7 +110,7 @@ mod tests {
     
     #[test]
     fn test_softmax_empty_input() {
-        let input = Array1::<f32>::zeros(0); // Empty Array1<f32>
+        let input = arr1(&<[f32; 0]>[]); // Empty Array1<f32>
         let output = softmax(&input);
         assert!(output.is_empty());
     }

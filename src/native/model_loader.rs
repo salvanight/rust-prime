@@ -1,6 +1,6 @@
 // src/model_loader.rs
 
-use super::tensor_engine::Tensor;
+use crate::tensor_engine::Tensor;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
