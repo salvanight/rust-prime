@@ -213,3 +213,84 @@ mod tests {
         assert_eq!(mlp.current_device(), Device::CPU);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accelerator::{CpuTensor, Device, Tensor}; // Module is already in super
+
+    // Helper to create MLP for testing
+    fn test_mlp(n_embd: usize, n_inner: usize) -> MLP {
+        let c_fc_weight_data = vec![0.0f32; n_embd * n_inner];
+        let c_fc_weight_shape = vec![n_embd, n_inner];
+        let c_fc_bias_data = vec![0.0f32; n_inner];
+        let c_fc_bias_shape = vec![n_inner];
+
+        let c_proj_weight_data = vec![0.0f32; n_inner * n_embd];
+        let c_proj_weight_shape = vec![n_inner, n_embd];
+        let c_proj_bias_data = vec![0.0f32; n_embd];
+        let c_proj_bias_shape = vec![n_embd];
+
+        MLP::new(
+            &c_fc_weight_data, &c_fc_weight_shape,
+            &c_fc_bias_data, &c_fc_bias_shape,
+            &c_proj_weight_data, &c_proj_weight_shape,
+            &c_proj_bias_data, &c_proj_bias_shape,
+        ).unwrap()
+    }
+
+    #[test]
+    fn test_mlp_forward_2d_input() {
+        let n_embd = 12;
+        let n_inner = 48; // Typically 4 * n_embd
+        let seq_len = 5;
+        let mlp = test_mlp(n_embd, n_inner);
+
+        let hidden_states_data: Vec<f32> = (0..(seq_len * n_embd)).map(|x| x as f32 * 0.1).collect();
+        let hidden_states_shape = vec![seq_len, n_embd];
+        let hidden_states = CpuTensor::from_data_and_shape(&hidden_states_data, &hidden_states_shape, Device::CPU).unwrap();
+
+        let result = mlp.forward(hidden_states);
+        assert!(result.is_ok(), "MLP forward failed: {:?}", result.err());
+        let output_tensor = result.unwrap();
+        assert_eq!(output_tensor.shape(), &[seq_len, n_embd], "Output shape mismatch for 2D input.");
+        assert_eq!(output_tensor.device(), Device::CPU, "Output device mismatch for 2D input.");
+
+        // Verify some output values. Since weights are 0, and bias is 0,
+        // output of first linear is 0. GELU(0) is 0. Output of second linear is 0.
+        let output_slice = output_tensor.as_slice().unwrap();
+        assert!(output_slice.iter().all(|&x| (x - 0.0).abs() < f32::EPSILON), "Output data is not all zeros as expected with zero weights/biases.");
+    }
+
+    #[test]
+    fn test_mlp_forward_3d_input() {
+        let n_embd = 12;
+        let n_inner = 48;
+        let batch_size = 2;
+        let seq_len = 5;
+        let mlp = test_mlp(n_embd, n_inner);
+
+        let hidden_states_data: Vec<f32> = (0..(batch_size * seq_len * n_embd)).map(|x| x as f32 * 0.1).collect();
+        let hidden_states_shape = vec![batch_size, seq_len, n_embd];
+        let hidden_states = CpuTensor::from_data_and_shape(&hidden_states_data, &hidden_states_shape, Device::CPU).unwrap();
+
+        let result = mlp.forward(hidden_states);
+        assert!(result.is_ok(), "MLP forward failed for 3D input: {:?}", result.err());
+        let output_tensor = result.unwrap();
+        assert_eq!(output_tensor.shape(), &[batch_size, seq_len, n_embd], "Output shape mismatch for 3D input.");
+        assert_eq!(output_tensor.device(), Device::CPU, "Output device mismatch for 3D input.");
+
+        let output_slice = output_tensor.as_slice().unwrap();
+        assert!(output_slice.iter().all(|&x| (x - 0.0).abs() < f32::EPSILON), "Output data is not all zeros for 3D input.");
+    }
+
+    #[test]
+    fn test_mlp_to_device_cpu() {
+        let n_embd = 12;
+        let n_inner = 48;
+        let mut mlp = test_mlp(n_embd, n_inner);
+        assert_eq!(mlp.current_device(), Device::CPU);
+        assert!(mlp.to_device(Device::CPU).is_ok());
+        assert_eq!(mlp.current_device(), Device::CPU);
+    }
+}

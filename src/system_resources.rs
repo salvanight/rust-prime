@@ -1,7 +1,6 @@
 use sysinfo::{System, SystemExt, CpuExt, ProcessExt, DiskExt}; // Added ProcessExt, DiskExt for more detailed info if needed later
 
-// sysinfo returns memory values in KiB. Use this factor to convert KiB -> GB
-const KIB_TO_GB: f32 = 1024.0 * 1024.0; // 1024 KiB * 1024 = 1 GiB
+const GB: u64 = 1024 * 1024 * 1024; // Helper for converting bytes to GB
 
 #[derive(Debug)]
 pub struct SystemResources {
@@ -30,10 +29,11 @@ impl SystemResources {
         // For load average, sysinfo provides it as an array [1min, 5min, 15min]
         let load_avg = sys.load_average();
 
-        let total_memory_kib = sys.total_memory();
-        let used_memory_kib = sys.used_memory(); // sysinfo reports KiB for memory values.
-                                                 // "available_memory" gives a clearer sense of free memory across OSes.
-        let available_memory_kib = sys.available_memory();
+        let total_memory_bytes = sys.total_memory();
+        let used_memory_bytes = sys.used_memory(); // sysinfo's "used_memory" can sometimes be confusing across OSes.
+                                                  // "available_memory" is often more reliable if what you want is "free for new apps".
+                                                  // Let's use available_memory for ram_available_gb for clarity.
+        let available_memory_bytes = sys.available_memory();
 
 
         Self {
@@ -42,12 +42,12 @@ impl SystemResources {
             cpu_load_avg_one: load_avg.one as f32,
             cpu_load_avg_five: load_avg.five as f32,
             cpu_load_avg_fifteen: load_avg.fifteen as f32,
-            ram_total_gb: total_memory_kib as f32 / KIB_TO_GB,
-            ram_used_gb: used_memory_kib as f32 / KIB_TO_GB,
-            ram_available_gb: available_memory_kib as f32 / KIB_TO_GB,
-            swap_total_gb: sys.total_swap() as f32 / KIB_TO_GB,
-            swap_used_gb: sys.used_swap() as f32 / KIB_TO_GB,
-            swap_available_gb: (sys.total_swap() - sys.used_swap()) as f32 / KIB_TO_GB,
+            ram_total_gb: total_memory_bytes as f32 / GB as f32,
+            ram_used_gb: used_memory_bytes as f32 / GB as f32,
+            ram_available_gb: available_memory_bytes as f32 / GB as f32,
+            swap_total_gb: sys.total_swap() as f32 / GB as f32,
+            swap_used_gb: sys.used_swap() as f32 / GB as f32,
+            swap_available_gb: (sys.total_swap() - sys.used_swap()) as f32 / GB as f32,
             vram_available_gb: None, // Placeholder
             ssd_io_bandwidth_mbps: None, // Placeholder
         }
@@ -63,10 +63,10 @@ impl SystemResources {
         self.cpu_load_avg_five = load_avg.five as f32;
         self.cpu_load_avg_fifteen = load_avg.fifteen as f32;
 
-        self.ram_used_gb = self.sys.used_memory() as f32 / KIB_TO_GB;
-        self.ram_available_gb = self.sys.available_memory() as f32 / KIB_TO_GB;
-        self.swap_used_gb = self.sys.used_swap() as f32 / KIB_TO_GB;
-        self.swap_available_gb = (self.sys.total_swap() - self.sys.used_swap()) as f32 / KIB_TO_GB;
+        self.ram_used_gb = self.sys.used_memory() as f32 / GB as f32;
+        self.ram_available_gb = self.sys.available_memory() as f32 / GB as f32;
+        self.swap_used_gb = self.sys.used_swap() as f32 / GB as f32;
+        self.swap_available_gb = (self.sys.total_swap() - self.sys.used_swap()) as f32 / GB as f32;
         
         // Individual CPU usage can be fetched via self.sys.cpus() list if needed.
         // For example, overall CPU usage:

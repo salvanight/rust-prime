@@ -1,8 +1,8 @@
 #![cfg(feature = "ndarray_backend")]
 // Ensure these 'use' statements are correct based on your project structure.
 // If moe.rs, gating.rs, system_resources.rs are in src/, then crate::module_name is typical.
-use super::moe::Expert; // Expert trait defined in this module
-use super::gating::GatingLayer; // Gating layer in this module
+use crate::moe::Expert; // Assuming moe.rs is in src/ and contains pub trait Expert
+use crate::gating::GatingLayer; // Assuming gating.rs is in src/
 use crate::system_resources::SystemResources; // Assuming system_resources.rs is in src/
 use crate::cache_tier::{CacheTier, filter_experts_by_tier}; // Added for cache tier filtering
 

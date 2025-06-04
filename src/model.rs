@@ -91,7 +91,7 @@ impl GPT2Model {
         &self,
         input_ids: &Array2<i32>,
         attention_mask_option: Option<&ArrayD<f32>>,
-        mut model_kv_cache: Option<&mut ModelKVCache>,
+        model_kv_cache: Option<&mut ModelKVCache>,
     ) -> Result<ArrayD<f32>, Box<dyn std::error::Error>> {
         let batch_size = input_ids.shape()[0];
         let current_seq_len = input_ids.shape()[1];
@@ -106,7 +106,7 @@ impl GPT2Model {
 
         if let Some(cache_ref) = model_kv_cache.as_mut() {
             if cache_ref.is_empty() {
-                cache_ref.resize_with(self.h.len(), Vec::<KVCacheEntry>::new);
+                *cache_ref = vec![Vec::new(); self.h.len()];
             }
         }
 
@@ -426,11 +426,8 @@ mod tests {
     fn test_gpt2model_forward_smoke() -> Result<(), Box<dyn std::error::Error>> {
         let config = create_test_config_for_model(8, 2, 2, 16, 20);
         let model = GPT2Model::new(config)?;
-        let batch_size = 1usize;
-        let seq_len = 5usize;
-        let input_ids_data = (0..batch_size * seq_len)
-            .map(|i| (i % model.config.vocab_size as usize) as i32)
-            .collect();
+        let batch_size = 1; let seq_len = 5;
+        let input_ids_data = (0..batch_size * seq_len).map(|i| (i % model.config.vocab_size) as i32).collect();
         let input_ids = Array2::from_shape_vec((batch_size, seq_len), input_ids_data)?;
         
         let output_no_cache = model.forward(&input_ids, None, None)?;
