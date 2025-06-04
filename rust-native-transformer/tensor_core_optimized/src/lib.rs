@@ -119,10 +119,10 @@ impl<T> Tensor<T> {
         }
         self.data.get_mut(flat_idx).ok_or_else(|| TensorError::OutOfBounds(format!("Calculated flat index {} out of bounds for data length {} (mut access)", flat_idx, self.data.len())))
     }
+}
 
-    pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self, TensorError>
-    where T: Clone
-    {
+impl<T: Clone> Tensor<T> {
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self, TensorError> {
         let current_num_elements = self.num_elements();
         let new_num_elements: usize = if new_shape.is_empty() {1} else if new_shape.iter().any(|&d| d==0) {0} else {new_shape.iter().product()};
         if current_num_elements != new_num_elements {
@@ -133,7 +133,32 @@ impl<T> Tensor<T> {
         }
         Ok(Tensor { data: self.data.clone(), shape: new_shape })
     }
+
+    pub fn transpose(&self) -> Result<Tensor<T>, TensorError> {
+        if self.rank() != 2 {
+            return Err(TensorError::InvalidDimension(
+                "Transpose operation only supports 2D tensors.".to_string(),
+            ));
+        }
+
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+        let new_shape = vec![cols, rows];
+
+        if self.num_elements() == 0 {
+            return Tensor::new(Vec::new(), new_shape);
+        }
+
+        let mut new_data = Vec::with_capacity(self.data.len());
+        for j_new_row in 0..cols {
+            for i_new_col in 0..rows {
+                new_data.push(self.data[i_new_col * cols + j_new_row].clone());
+            }
+        }
+        Tensor::new(new_data, new_shape)
+    }
 }
+
 
 impl<T: Default + Clone> Tensor<T> {
     pub fn zeros(shape: Vec<usize>) -> Result<Self, TensorError> {
@@ -335,7 +360,7 @@ unsafe fn gelu_avx2(data_slice: &mut [f32]) {
 #[cfg(target_arch = "x86_64")]
 unsafe fn matmul_2d_avx2_fma(
     a_data: &[f32],
-    b_data: &[f32],
+    b_transposed_data: &[f32], // Expects B to be transposed [n_dim, k_dim]
     m: usize,
     k_dim: usize,
     n_dim: usize,
@@ -351,22 +376,21 @@ unsafe fn matmul_2d_avx2_fma(
                 while k_sidx + lanes <= k_dim {
                     let a_ptr = a_data.as_ptr().add(i * k_dim + k_sidx);
                     let a_vec = _mm256_loadu_ps(a_ptr);
-                    let b_val7 = *b_data.get_unchecked((k_sidx + 7) * n_dim + j);
-                    let b_val6 = *b_data.get_unchecked((k_sidx + 6) * n_dim + j);
-                    let b_val5 = *b_data.get_unchecked((k_sidx + 5) * n_dim + j);
-                    let b_val4 = *b_data.get_unchecked((k_sidx + 4) * n_dim + j);
-                    let b_val3 = *b_data.get_unchecked((k_sidx + 3) * n_dim + j);
-                    let b_val2 = *b_data.get_unchecked((k_sidx + 2) * n_dim + j);
-                    let b_val1 = *b_data.get_unchecked((k_sidx + 1) * n_dim + j);
-                    let b_val0 = *b_data.get_unchecked(k_sidx * n_dim + j);
-                    let b_vec = _mm256_set_ps(b_val7, b_val6, b_val5, b_val4, b_val3, b_val2, b_val1, b_val0);
+
+                    // Load from B_transposed: B_T[j, k_sidx]
+                    // This corresponds to B[k_sidx, j] from original B
+                    // Data from j-th row of B_transposed is contiguous.
+                    let b_vec = _mm256_loadu_ps(b_transposed_data.as_ptr().add(j * k_dim + k_sidx));
+
                     sum_simd_acc = _mm256_fmadd_ps(a_vec, b_vec, sum_simd_acc);
                     k_sidx += lanes;
                 }
                 sum_val += horizontal_sum_m256(sum_simd_acc);
             }
+            // Scalar loop for remaining elements in k_dim
             for k_rem_idx in k_sidx..k_dim {
-                sum_val += *a_data.get_unchecked(i * k_dim + k_rem_idx) * *b_data.get_unchecked(k_rem_idx * n_dim + j);
+                sum_val += *a_data.get_unchecked(i * k_dim + k_rem_idx) *
+                           *b_transposed_data.get_unchecked(j * k_dim + k_rem_idx);
             }
             *c_data.get_unchecked_mut(i * n_dim + j) = sum_val;
         }
@@ -440,37 +464,20 @@ impl Tensor<f32> {
                 let current_tensor_axis_dim = t_ref.shape[axis];
                 let current_tensor_inner_dims_product: usize = t_ref.shape[axis+1..].iter().product();
                 for axis_el_idx in 0..current_tensor_axis_dim {
-                    let mut current_input_flat_idx = 0; // To be correctly calculated
-                    // Simplified calculation for current_input_flat_idx (assumes outer_idx is correctly flattened for t_ref's prefix)
-                    // This part of concat logic was identified as potentially problematic before and might need full review.
-                    // For now, using the prior version's calculation which was:
-                     let mut temp_outer_idx = outer_idx; // This calculation is for first_tensor's strides
-                     for d_rev_idx in 0..axis {
-                         let d = axis - 1 - d_idx_rev;
-                         // This calculation of current_input_flat_idx within the loop seems incorrect
-                         // as it re-calculates from scratch for each axis_el_idx and t_ref.
-                         // A correct calculation would determine the starting block based on outer_idx
-                         // and then iterate axis_el_idx for the current t_ref.
-                         // The logic from the provided code was:
-                         // current_input_flat_idx += (temp_outer_idx % first_tensor.shape[d]) * first_tensor_strides[d];
-                         // temp_outer_idx /= first_tensor.shape[d];
-                     }
-                     // Re-evaluating the slice calculation logic for concat:
-                     // We need to map the multi-dimensional outer_idx to a flat starting point for the outer block.
-                     // Then, for each tensor t_ref, iterate its contribution along the axis.
-                     // The original logic for current_input_flat_idx inside the innermost loop was flawed.
-                     // A more robust way is to calculate the starting point of the slab for the current t_ref and outer_idx.
-
-                    let mut start_offset_in_t_ref = 0;
-                    let mut_temp_outer_idx_for_t_ref = outer_idx;
-                    let mut t_ref_multiplier = t_ref.num_elements();
-
-                    for d_idx in 0..axis {
-                        t_ref_multiplier /= t_ref.shape[d_idx];
-                        start_offset_in_t_ref += (mut_temp_outer_idx_for_t_ref % t_ref.shape[d_idx]) * t_ref_multiplier;
-                         mut_temp_outer_idx_for_t_ref /= t_ref.shape[d_idx];
+                    let mut current_input_flat_idx = 0;
+                    let mut temp_outer_idx = outer_idx;
+                     // This logic calculates the offset due to dimensions *before* the concatenation axis,
+                     // using the strides of the *first_tensor* as a reference for those dimensions,
+                     // which is valid because non-axis dimensions must match across all tensors.
+                    for d_rev_idx in 0..axis {
+                        let d = axis - 1 - d_idx_rev;
+                        current_input_flat_idx += (temp_outer_idx % first_tensor.shape[d]) * first_tensor_strides[d];
+                        temp_outer_idx /= first_tensor.shape[d];
                     }
-                     current_input_flat_idx = start_offset_in_t_ref + axis_el_idx * current_tensor_inner_dims_product;
+                    // Now, add offset from the concatenation axis itself for the current tensor `t_ref`
+                    // and the specific slice `axis_el_idx` along that axis.
+                    // The number of elements per "row" along the concat axis in `t_ref` is `current_tensor_inner_dims_product`.
+                    current_input_flat_idx += axis_el_idx * current_tensor_inner_dims_product;
 
 
                     if t_ref.data.is_empty() && current_tensor_inner_dims_product > 0 {
@@ -521,10 +528,14 @@ impl Tensor<f32> {
            is_x86_feature_detected!("fma") &&
            m > 0 && k_a > 0 && n > 0
         {
+            // Transpose B for the SIMD kernel
+            let b_transposed = b.transpose()?;
             unsafe {
-                matmul_2d_avx2_fma(&a.data, &b.data, m, k_a, n, &mut result_data);
+                // Pass b_transposed.data to the AVX2 kernel
+                matmul_2d_avx2_fma(&a.data, &b_transposed.data, m, k_a, n, &mut result_data);
             }
         } else if m > 0 && k_a > 0 && n > 0 {
+            // Scalar path
             for i_idx in 0..m {
                 for j_idx in 0..n {
                     let mut sum = 0.0;
@@ -535,6 +546,7 @@ impl Tensor<f32> {
                 }
             }
         }
+        // If m, n, or k_a is 0, result_data will be empty or loops won't run, which is correct.
         Tensor::new(result_data, vec![m, n])
     }
 
@@ -713,7 +725,7 @@ mod tests {
 
     fn create_random_tensor(shape: Vec<usize>, seed: u64) -> Tensor<f32> {
         let mut rng = StdRng::seed_from_u64(seed);
-        let num_elements = if shape.is_empty() {1} else {shape.iter().filter(|&&d| d != 0).product()}; // product can be 0 if a dim is 0
+        let num_elements = if shape.is_empty() {1} else {shape.iter().filter(|&&d| d != 0).product()};
         let data = (0..num_elements).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
         Tensor::new(data, shape).unwrap()
     }
@@ -829,6 +841,42 @@ mod tests {
             _ => panic!("Unexpected error type for reshape incompatibility"),
         }
     }
+     #[test]
+    fn test_tensor_transpose() {
+        let t1 = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+        let t1_transposed = t1.transpose().unwrap();
+        assert_eq!(t1_transposed.shape, vec![3, 2]);
+        assert_eq!(t1_transposed.data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+
+        let t2 = Tensor::new(vec![1.0, 2.0, 3.0], vec![3, 1]).unwrap();
+        let t2_transposed = t2.transpose().unwrap();
+        assert_eq!(t2_transposed.shape, vec![1, 3]);
+        assert_eq!(t2_transposed.data, vec![1.0, 2.0, 3.0]);
+
+        let t3 = Tensor::new(vec![1.0, 2.0, 3.0], vec![1, 3]).unwrap();
+        let t3_transposed = t3.transpose().unwrap();
+        assert_eq!(t3_transposed.shape, vec![3, 1]);
+        assert_eq!(t3_transposed.data, vec![1.0, 2.0, 3.0]);
+
+        let t4_empty_data_valid_shape = Tensor::new(Vec::<f32>::new(), vec![0,3]).unwrap();
+        let t4_transposed = t4_empty_data_valid_shape.transpose().unwrap();
+        assert_eq!(t4_transposed.shape, vec![3,0]);
+        assert!(t4_transposed.data.is_empty());
+
+        let t5_empty_data_zero_shape = Tensor::new(Vec::<f32>::new(), vec![0,0]).unwrap();
+        let t5_transposed = t5_empty_data_zero_shape.transpose().unwrap();
+        assert_eq!(t5_transposed.shape, vec![0,0]);
+        assert!(t5_transposed.data.is_empty());
+    }
+
+    #[test]
+    fn test_transpose_invalid_dim() {
+        let t_1d = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+        assert!(t_1d.transpose().is_err());
+        let t_3d = Tensor::new(vec![1.0; 8], vec![2,2,2]).unwrap();
+        assert!(t_3d.transpose().is_err());
+    }
+
 
     #[test]
     fn test_matmul_2x2_2x2() {
@@ -982,3 +1030,5 @@ mod tests {
         }
     }
 }
+
+[end of rust-native-transformer/tensor_core_optimized/src/lib.rs]
