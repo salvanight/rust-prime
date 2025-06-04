@@ -1,6 +1,6 @@
 #![cfg(feature = "ndarray_backend")]
 use ndarray::{ArrayD, Array1, Axis}; // Added Axis
-use crate::gating::GatingLayer; // Import GatingLayer
+use super::gating::GatingLayer; // Import GatingLayer from this module
 use crate::cache_tier::{CacheTier, ExpertTagged};
 
 /// Defines the interface for an expert in the Mixture of Experts (MoE) system.

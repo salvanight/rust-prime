@@ -4,8 +4,6 @@ use crate::config::GPT2Config;
 use crate::common::{LayerNorm, ModelKVCache}; // Import ModelKVCache
 use crate::accelerator::{CpuTensor, Device, Module, Tensor};
 use crate::attention::MultiHeadAttention;
-use crate::common::{LayerNorm, ModelKVCache}; // ModelKVCache might need rethink for non-CPU
-use crate::config::GPT2Config;
 use crate::mlp::MLP;
 use std::error::Error;
 // use ndarray::{ArrayD, IxDyn, Array2, s, Axis, ArrayView2}; // Commenting out as we replace ndarray with CpuTensor

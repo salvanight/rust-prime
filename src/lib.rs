@@ -22,6 +22,9 @@ pub mod model;
 32s0bh-codex/add-test-for-add_new_tokens-behavior
 =======
 pub mod tokenizer; // This will now load src/tokenizer.rs
+pub mod cache_tier;
+pub mod system_resources;
+pub mod repl_feedback;
 pub mod native;
 #[cfg(feature = "ndarray_backend")]
 pub mod ndarray_specific;
