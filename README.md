@@ -138,6 +138,50 @@ The **`rust-native-transformer`** is a minimally viable GPT-2 inference engine d
 
 The **experimental library in the root `src/` directory** is at an earlier stage. It explores an alternative implementation strategy using `ndarray` and the `tokenizers` crate, and its development is ongoing.
 
+## File Uploader UI (Experimental)
+
+As part of the experimental `ndarray`-based library, a web-based UI is available for uploading and inspecting model and tokenizer files. This UI is served by modifying the `native_cli` binary.
+
+### Running the UI
+
+1.  **Build the application**:
+    ```bash
+    cargo build --release --bin native_cli
+    ```
+    (or `cargo build --bin native_cli` for a debug build). Ensure you have the necessary features enabled if you usually build with specific ones (e.g., `ndarray_backend` is enabled by default for `native_cli`).
+
+2.  **Run the `native_cli` binary**:
+    ```bash
+    ./target/release/native_cli
+    ```
+    (or `./target/debug/native_cli` for a debug build).
+
+    When the `native_cli` starts with the UI enabled (current default), it will launch the web server.
+
+3.  **Access the UI**:
+    Open your web browser and navigate to:
+    [http://127.0.0.1:8080](http://127.0.0.1:8080)
+
+    The port `8080` is currently hardcoded in the application.
+
+### UI Features
+
+*   **File Upload**:
+    *   Select files using the browse button.
+    *   Drag and drop files onto the designated drop zone.
+*   **Supported File Types**:
+    *   `.safetensors`: For model weights. Tensor names and shapes will be displayed.
+    *   `tokenizer.json`: For tokenizer configurations. A preview of the JSON content will be shown.
+*   **Information Display**:
+    *   Basic details extracted from the uploaded files are shown on the page.
+*   **Error Handling**:
+    *   The UI displays messages for processing errors (e.g., corrupted files, invalid formats).
+    *   Unsupported file types are skipped with a notification.
+*   **Styling**:
+    *   Uses Pico.CSS for a clean, lightweight visual appearance.
+
+This UI provides a convenient way to quickly inspect the metadata of common model and tokenizer files.
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -1,8 +1,8 @@
 // src/text_generator.rs
 
-use crate::transformer_core::{GPT2Model, TransformerError as ModelError};
-use crate::tensor_engine::{Tensor, TensorError};
-use crate::resonance_feedback::ResonanceFeedbackStore; // Added
+use super::transformer_core::{GPT2Model, TransformerError as ModelError};
+use super::tensor_engine::{Tensor, TensorError};
+use super::resonance_feedback::ResonanceFeedbackStore; // Added
 
 // 1. TextGeneratorError Enum
 #[derive(Debug)]
@@ -153,7 +153,7 @@ pub fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transformer_core::{Config, GPT2Model}; // For creating a dummy model
+    use super::transformer_core::{Config, GPT2Model}; // For creating a dummy model
     use std::collections::HashMap; // For dummy weights
 
     fn create_dummy_model_for_generation(vocab_size: usize, block_size: usize, n_embd: usize) -> GPT2Model {
