@@ -1,0 +1,7 @@
+{
+  "name": "dummy_tokenizer_corrupted",
+  "version": "1.0.0",
+  "model": {
+    "type": "BPE"
+  },
+} // Extra comma makes it invalid JSON
