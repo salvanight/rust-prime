@@ -93,15 +93,40 @@ async fn test_upload_endpoint_integration() {
         .await
         .expect("Failed to send request");
 
-    assert_eq!(response.status().as_u16(), 400, "Expected Bad Request due to corrupted file");
+    assert_eq!(response.status().as_u16(), 400, "Expected Bad Request due to corrupted and skipped files");
 
     let body_bytes = response.body().await.expect("Failed to read response body");
     let body_str = std::str::from_utf8(&body_bytes).expect("Response body was not valid UTF-8");
 
-    assert!(body_str.contains("File Processing Errors"), "Body should contain processing errors header");
-    assert!(body_str.contains("Error deserializing SafeTensors file 'corrupted.safetensors'"), "Body should mention corrupted safetensor");
-    assert!(body_str.contains("Successfully Processed Files (if any)"), "Body should have success section for valid files");
-    assert!(body_str.contains("<h3>tokenizer.json</h3>"), "Body should contain info for valid tokenizer");
+    // Check for the main error wrapper and heading
+    assert!(body_str.contains("<div class=\"error-message\">"), "Body should contain error-message div");
+    assert!(body_str.contains("<h2>File Processing Issues:</h2>"), "Body should contain processing issues header");
+
+    // Check for specific error messages
+    assert!(
+        body_str.contains("<strong>File: 'corrupted.safetensors'</strong> - Invalid SafeTensors format."),
+        "Body should mention corrupted safetensor with new formatting"
+    );
+    assert!(
+        body_str.contains("<strong>File: 'other.txt'</strong> - Skipped. This file type is not supported."),
+        "Body should mention skipped other.txt file with new formatting"
+    );
+
+    // Check for the section detailing successfully processed files (if any)
+    assert!(
+        body_str.contains("<hr><h3>Successfully Processed Files (if any):</h3>"),
+        "Body should have success section for valid files"
+    );
+    assert!(
+        body_str.contains("<h4>tokenizer.json</h4>"), // Changed from h3 to h4 in error report for successful items
+        "Body should contain info for valid tokenizer"
+    );
+    // Ensure the content of tokenizer.json is still there (simplified check)
+    assert!(
+        body_str.contains("content_preview"),
+        "Body should contain tokenizer preview content"
+    );
+
 
     // Stop the server
     test_srv_handle.stop(true).await;

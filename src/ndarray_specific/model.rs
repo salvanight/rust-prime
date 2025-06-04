@@ -4,8 +4,6 @@ use crate::config::GPT2Config;
 use crate::common::{LayerNorm, ModelKVCache}; // Import ModelKVCache
 use crate::accelerator::{CpuTensor, Device, Module, Tensor};
 use crate::attention::MultiHeadAttention;
-use crate::common::{LayerNorm, ModelKVCache}; // ModelKVCache might need rethink for non-CPU
-use crate::config::GPT2Config;
 use crate::mlp::MLP;
 use std::error::Error;
 // use ndarray::{ArrayD, IxDyn, Array2, s, Axis, ArrayView2}; // Commenting out as we replace ndarray with CpuTensor
@@ -363,13 +361,9 @@ mod tests {
         TransformerBlock::new(config).expect("Failed to create TransformerBlock for testing")
     }
 
-    // Helper to create GPT2Model for testing
-    // Note: GPT2Model::new now requires wte_data and wpe_data.
-    // We need to provide dummy data for these.
+    // Helper to create GPT2Model for testing using the default constructor
     fn test_gpt2_model(config: &GPT2Config) -> GPT2Model {
-        let wte_data = vec![0.0f32; (config.vocab_size * config.n_embd) as usize];
-        let wpe_data = vec![0.0f32; (config.n_positions * config.n_embd) as usize];
-        GPT2Model::new(config, &wte_data, &wpe_data).expect("Failed to create GPT2Model for testing")
+        GPT2Model::new(config).expect("Failed to create GPT2Model for testing")
     }
 
     #[test]
