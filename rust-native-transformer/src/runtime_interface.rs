@@ -1,6 +1,6 @@
 // src/runtime_interface.rs
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::error::Error;
 
 use crate::model_loader;
@@ -8,6 +8,13 @@ use crate::tensor_engine; // Not directly used here, but good to have if errors 
 use crate::text_generator;
 use crate::tokenizer_core;
 use crate::transformer_core;
+
+#[derive(ValueEnum, Clone, Debug)]
+enum SamplingArg {
+    Greedy,
+    TopK,
+    TopP,
+}
 // use crate::resonance_feedback::{ResonanceFeedbackStore, ExperienceEntry, ValidationStatus}; // Added
 // use uuid; // Added for direct UUID usage if ExperienceEntry::new() doesn't set it (it does)
 
@@ -28,6 +35,13 @@ struct CliArgs {
     max_length: usize,
     #[clap(long, value_parser, default_value_t = 50256)] // Default EOS for GPT-2
     eos_token_id: u32,
+
+    #[clap(long, value_enum, default_value_t = SamplingArg::Greedy)]
+    sampling: SamplingArg,
+    #[clap(long, value_parser, default_value_t = 40)]
+    top_k: usize,
+    #[clap(long, value_parser, default_value_t = 0.9)]
+    top_p: f32,
 
     // Model Configuration Arguments
     #[clap(long, value_parser, default_value_t = 12)]
@@ -53,7 +67,7 @@ enum RuntimeError {
     Transformer(transformer_core::TransformerError),
     TextGenerator(text_generator::TextGeneratorError),
     Io(std::io::Error), // For other IO errors if any
-    Message(String), // For general messages
+    Message(String),    // For general messages
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -84,27 +98,36 @@ impl Error for RuntimeError {
 
 // Implement From for each error type to simplify error handling with `?`
 impl From<tokenizer_core::TokenizerError> for RuntimeError {
-    fn from(err: tokenizer_core::TokenizerError) -> Self { RuntimeError::Tokenizer(err) }
+    fn from(err: tokenizer_core::TokenizerError) -> Self {
+        RuntimeError::Tokenizer(err)
+    }
 }
 impl From<model_loader::ModelLoaderError> for RuntimeError {
-    fn from(err: model_loader::ModelLoaderError) -> Self { RuntimeError::ModelLoader(err) }
+    fn from(err: model_loader::ModelLoaderError) -> Self {
+        RuntimeError::ModelLoader(err)
+    }
 }
 impl From<transformer_core::TransformerError> for RuntimeError {
-    fn from(err: transformer_core::TransformerError) -> Self { RuntimeError::Transformer(err) }
+    fn from(err: transformer_core::TransformerError) -> Self {
+        RuntimeError::Transformer(err)
+    }
 }
 impl From<text_generator::TextGeneratorError> for RuntimeError {
-    fn from(err: text_generator::TextGeneratorError) -> Self { RuntimeError::TextGenerator(err) }
+    fn from(err: text_generator::TextGeneratorError) -> Self {
+        RuntimeError::TextGenerator(err)
+    }
 }
 impl From<tensor_engine::TensorError> for RuntimeError {
-    fn from(err: tensor_engine::TensorError) -> Self { 
+    fn from(err: tensor_engine::TensorError) -> Self {
         // Wrap TensorError into a higher-level error, e.g. TransformerError or a new variant
         RuntimeError::Transformer(transformer_core::TransformerError::TensorError(err))
     }
 }
 impl From<std::io::Error> for RuntimeError {
-    fn from(err: std::io::Error) -> Self { RuntimeError::Io(err) }
+    fn from(err: std::io::Error) -> Self {
+        RuntimeError::Io(err)
+    }
 }
-
 
 // 3. `run_cli` Function
 pub fn run_cli() -> Result<(), Box<dyn Error>> {
@@ -120,7 +143,8 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
 
     // 3. Load Model
     println!("Loading model weights from: {}", args.model_path);
-    let weights_map = model_loader::load_safetensors(&args.model_path).map_err(RuntimeError::from)?;
+    let weights_map =
+        model_loader::load_safetensors(&args.model_path).map_err(RuntimeError::from)?;
     println!("Model weights loaded.");
 
     let config = transformer_core::Config {
@@ -133,12 +157,14 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
     };
     println!("Model configuration prepared: {:?}", config);
 
-    let model = transformer_core::GPT2Model::new(config, weights_map).map_err(RuntimeError::from)?;
+    let model =
+        transformer_core::GPT2Model::new(config, weights_map).map_err(RuntimeError::from)?;
     println!("GPT-2 Model instantiated.");
 
     // 4. Tokenize Prompt
     println!("Tokenizing prompt: \"{}\"", args.prompt);
-    let input_ids = tokenizer_core::encode(&args.prompt, &vocab, &merges).map_err(RuntimeError::from)?;
+    let input_ids =
+        tokenizer_core::encode(&args.prompt, &vocab, &merges).map_err(RuntimeError::from)?;
     if input_ids.is_empty() && !args.prompt.trim().is_empty() {
         // This can happen if all tokens in the prompt are unknown.
         return Err(Box::new(RuntimeError::Message(format!(
@@ -147,22 +173,32 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
         ))));
     }
     if args.prompt.trim().is_empty() && input_ids.is_empty() {
-         return Err(Box::new(RuntimeError::Message(
-            "Prompt is empty or only whitespace, resulting in no tokens to generate from.".to_string()
+        return Err(Box::new(RuntimeError::Message(
+            "Prompt is empty or only whitespace, resulting in no tokens to generate from."
+                .to_string(),
         )));
     }
     println!("Prompt token IDs: {:?}", input_ids);
-    
+
     // 5. Generate Text
-    println!("Generating text (max_length: {}, eos_token_id: {})...", args.max_length, args.eos_token_id);
+    println!(
+        "Generating text (max_length: {}, eos_token_id: {})...",
+        args.max_length, args.eos_token_id
+    );
+    let sampling_method = match args.sampling {
+        SamplingArg::Greedy => text_generator::SamplingMethod::Greedy,
+        SamplingArg::TopK => text_generator::SamplingMethod::TopK { k: args.top_k },
+        SamplingArg::TopP => text_generator::SamplingMethod::TopP { p: args.top_p },
+    };
     let generated_ids = text_generator::generate(
-        &model, 
-        input_ids.clone(), 
-        args.max_length, 
+        &model,
+        input_ids.clone(),
+        args.max_length,
         args.eos_token_id,
-        None
-        // Some(&feedback_store) // Pass the feedback store
-    ).map_err(RuntimeError::from)?;
+        sampling_method,
+        None, // Some(&feedback_store) // Pass the feedback store
+    )
+    .map_err(RuntimeError::from)?;
     println!("Generated token IDs: {:?}", generated_ids);
 
     // 6. Decode Output
@@ -190,7 +226,7 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
     println!("Any other key to skip/unvalidated.");
 
     let _user_feedback_input = String::new(); // Prefixed with _ as it's not used after commenting out stdin().read_line()
-    // std::io::stdin().read_line(&mut user_feedback_input).map_err(|e| RuntimeError::Io(e))?; // Propagate IO error
+                                              // std::io::stdin().read_line(&mut user_feedback_input).map_err(|e| RuntimeError::Io(e))?; // Propagate IO error
 
     // let validation_status = match user_feedback_input.trim() {
     //     "1" => ValidationStatus::Accepted,
