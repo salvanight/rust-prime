@@ -6,3 +6,4 @@ pub mod transformer_core;
 pub mod text_generator;
 pub mod runtime_interface;
 pub mod resonance_feedback;
+pub mod training;
