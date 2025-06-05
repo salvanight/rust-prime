@@ -162,11 +162,16 @@ pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error>
                     let preview = info.get(&format!("{}.preview", name)).unwrap_or(&"N/A".to_string());
                     // Basic HTML escaping for attribute values, especially preview
                     let preview_escaped = html_escape::encode_double_quoted_attribute(preview);
-                    let shape_escaped = html_escape::encode_double_quoted_attribute(shape); // Also escape shape
+                    let shape_escaped = html_escape::encode_double_quoted_attribute(shape);
+                    let tensor_id = html_escape::encode_double_quoted_attribute(&format!("{}::{}", filename, name));
 
                     error_html_response.push_str(&format!(
-                        "<li data-dtype=\"{}\" data-preview=\"{}\" data-shape=\"{}\">{}: {}</li>",
-                        dtype, preview_escaped, shape_escaped, name, shape
+                        "<li data-dtype=\"{}\" data-preview=\"{}\" data-shape=\"{}\" data-tensor-id=\"{}\">"
+                        + "<input type=\"checkbox\" name=\"tensor_compare_select\" value=\"{}\"> "
+                        + "{}: {}</li>",
+                        dtype, preview_escaped, shape_escaped, tensor_id, // tensor_id for data attribute
+                        tensor_id, // tensor_id for checkbox value
+                        name, shape
                     ));
                 }
                 error_html_response.push_str("</ul>");
@@ -211,11 +216,16 @@ pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error>
                     let preview = info.get(&format!("{}.preview", name)).unwrap_or(&"N/A".to_string());
                     // Basic HTML escaping for attribute values, especially preview
                     let preview_escaped = html_escape::encode_double_quoted_attribute(preview);
-                    let shape_escaped = html_escape::encode_double_quoted_attribute(shape); // Also escape shape
+                    let shape_escaped = html_escape::encode_double_quoted_attribute(shape);
+                    let tensor_id = html_escape::encode_double_quoted_attribute(&format!("{}::{}", filename, name));
 
                     html_response.push_str(&format!(
-                        "<li data-dtype=\"{}\" data-preview=\"{}\" data-shape=\"{}\">{}: {}</li>",
-                        dtype, preview_escaped, shape_escaped, name, shape
+                        "<li data-dtype=\"{}\" data-preview=\"{}\" data-shape=\"{}\" data-tensor-id=\"{}\">"
+                        + "<input type=\"checkbox\" name=\"tensor_compare_select\" value=\"{}\"> "
+                        + "{}: {}</li>",
+                        dtype, preview_escaped, shape_escaped, tensor_id, // tensor_id for data attribute
+                        tensor_id, // tensor_id for checkbox value
+                        name, shape
                     ));
                 }
                 html_response.push_str("</ul>");
@@ -444,8 +454,15 @@ mod tests {
 
         assert!(body_str.contains("<h3>test.safetensors</h3>"));
         assert!(body_str.contains("<ul>"));
-        let expected_li = "<li data-dtype=\"F32\" data-preview=\"[1.0000, 2.0000, 3.0000, 4.0000]\" data-shape=\"[2, 2]\">weight1: [2, 2]</li>";
-        assert!(body_str.contains(expected_li), "Generated HTML: {}", body_str);
+        let tensor_id_val = "test.safetensors::weight1";
+        let expected_li = format!(
+            "<li data-dtype=\"F32\" data-preview=\"[1.0000, 2.0000, 3.0000, 4.0000]\" data-shape=\"[2, 2]\" data-tensor-id=\"{}\">"
+            + "<input type=\"checkbox\" name=\"tensor_compare_select\" value=\"{}\"> "
+            + "weight1: [2, 2]</li>",
+            html_escape::encode_double_quoted_attribute(tensor_id_val),
+            html_escape::encode_double_quoted_attribute(tensor_id_val)
+        );
+        assert!(body_str.contains(&expected_li), "Generated HTML: {}\nExpected LI: {}", body_str, expected_li);
         assert!(body_str.contains("</ul>"));
     }
 
@@ -562,7 +579,14 @@ mod tests {
 
         // Check safetensor file part
         assert!(body_str.contains("<h3>good.safetensors</h3>"));
-        let expected_sf_li = "<li data-dtype=\"I64\" data-preview=\"[100, 200, 300]\" data-shape=\"[3]\">data_tensor: [3]</li>";
-        assert!(body_str.contains(expected_sf_li), "Generated HTML for safetensor in multi-upload: {}", body_str);
+        let sf_tensor_id_val = "good.safetensors::data_tensor";
+        let expected_sf_li = format!(
+            "<li data-dtype=\"I64\" data-preview=\"[100, 200, 300]\" data-shape=\"[3]\" data-tensor-id=\"{}\">"
+            + "<input type=\"checkbox\" name=\"tensor_compare_select\" value=\"{}\"> "
+            + "data_tensor: [3]</li>",
+            html_escape::encode_double_quoted_attribute(sf_tensor_id_val),
+            html_escape::encode_double_quoted_attribute(sf_tensor_id_val)
+        );
+        assert!(body_str.contains(&expected_sf_li), "Generated HTML for safetensor in multi-upload: {}\nExpected LI: {}", body_str, expected_sf_li);
     }
 }

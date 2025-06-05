@@ -114,6 +114,48 @@
             font-size: 1.5rem; /* Make it a bit larger if needed */
             /* Pico's default .close styling might already be good. */
         }
+
+        /* Comparison Modal Specific Styles */
+        #comparisonModal article {
+          max-width: 900px; /* Wider for two columns */
+          /* Inherits other modal article styles from #tensorModal article if not overridden by Pico's .modal > article */
+        }
+
+        #comparisonGrid {
+          display: grid; /* Ensure grid behavior if not automatically applied by class alone */
+          grid-template-columns: 1fr 1fr; /* Two equal columns */
+          gap: var(--pico-spacing, 1rem); /* Spacing between columns */
+        }
+
+        #tensorAComparisonArea, #tensorBComparisonArea {
+            border: 1px solid var(--pico-form-field-border-color, #ddd);
+            padding: var(--pico-spacing, 1rem);
+            border-radius: var(--pico-border-radius, 0.25rem);
+        }
+
+        #tensorAComparisonArea h4, #tensorBComparisonArea h4 {
+            margin-top: 0; /* Remove default top margin for headings in these areas */
+        }
+
+        #comparisonResultArea h4 {
+          margin-top: var(--pico-spacing, 1rem);
+          margin-bottom: 0.5rem;
+        }
+
+        /* Ensure consistent styling for <pre> tags in comparison view */
+        #tensorAContent pre,
+        #tensorBContent pre,
+        #analysisContent pre {
+          background-color: var(--pico-code-background, #f4f4f4);
+          border: 1px solid var(--pico-form-field-border-color, #ddd);
+          padding: 10px;
+          overflow-x: auto;
+          white-space: pre-wrap;
+          word-wrap: break-word;
+          max-height: 150px; /* Shorter for side-by-side previews */
+          font-size: 0.9em;
+          border-radius: var(--pico-border-radius, 0.25rem);
+        }
     </style>
 </head>
 <body>
@@ -135,6 +177,10 @@
             <!-- Server response will be displayed here -->
         </div>
 
+        <div id="compareButtonContainer" style="margin-top: 20px; text-align: center; display: none;">
+             <button id="compareTensorsButton" role="button" disabled>Compare Selected Tensors (0)</button>
+        </div>
+
         <!-- Placeholder for Tensor Details Modal -->
         <div id="tensorModal" class="modal" style="display:none;">
             <article>
@@ -148,6 +194,30 @@
                 </div>
             </article>
         </div>
+
+        <!-- Comparison Modal -->
+        <div id="comparisonModal" class="modal" style="display:none;">
+            <article>
+                <header>
+                    <a href="#close" aria-label="Close" class="close" id="closeComparisonModalButton"></a>
+                    Tensor Comparison
+                </header>
+                <div id="comparisonGrid" class="grid">
+                    <div id="tensorAComparisonArea">
+                        <h4>Tensor A Details</h4>
+                        <div id="tensorAContent"></div>
+                    </div>
+                    <div id="tensorBComparisonArea">
+                        <h4>Tensor B Details</h4>
+                        <div id="tensorBContent"></div>
+                    </div>
+                </div>
+                <div id="comparisonResultArea" style="margin-top: 20px;">
+                    <h4>Comparison Analysis</h4>
+                    <div id="analysisContent"></div>
+                </div>
+            </article>
+        </div>
     </main>
 
     <script>
@@ -157,9 +227,19 @@
         const dropZone = document.getElementById('dropZone');   // Visible drop zone area
         const responseDisplay = document.getElementById('uploadResults'); // Div to show server responses
         const uploadButton = document.getElementById('uploadButton'); // Submit button
-        const tensorModal = document.getElementById('tensorModal'); // Modal element
+
+        const tensorModal = document.getElementById('tensorModal'); // Modal element for single tensor details
         const tensorModalContent = document.getElementById('tensorModalContent'); // Modal content area
         const tensorModalCloseButton = document.getElementById('tensorModalCloseButton'); // Modal close button
+
+        const compareButton = document.getElementById('compareTensorsButton'); // Compare button
+        const compareButtonContainer = document.getElementById('compareButtonContainer'); // Container for compare button
+
+        const comparisonModal = document.getElementById('comparisonModal'); // New comparison modal
+        const closeComparisonModalButton = document.getElementById('closeComparisonModalButton'); // Its close button
+        const tensorAContent = document.getElementById('tensorAContent'); // Area for Tensor A in comparison
+        const tensorBContent = document.getElementById('tensorBContent'); // Area for Tensor B in comparison
+        const analysisContent = document.getElementById('analysisContent'); // Area for comparison results
 
         // --- Helper Functions ---
         function updateDropZoneText(files) {
@@ -241,8 +321,8 @@
                 // Display the server's HTML response (could be success info or error details)
                 responseDisplay.innerHTML = htmlData;
 
-                // After response is inserted, make tensor items clickable
-                attachTensorClickListeners();
+                // After response is inserted, make tensor items clickable and set up compare logic
+                setupTensorInteraction();
 
                 if (!response.ok) {
                     // Log a warning if the server response was not OK (e.g., 400, 500)
@@ -287,15 +367,25 @@
         }
 
         function attachTensorClickListeners() {
-            const tensorListItems = responseDisplay.querySelectorAll('li[data-dtype]');
+            const tensorListItems = responseDisplay.querySelectorAll('li[data-tensor-id]'); // Use data-tensor-id to identify tensor li
             tensorListItems.forEach(li => {
-                // Make the tensor name part clickable by wrapping it, or making the whole li clickable
-                // For simplicity, let's make the whole li clickable.
+                // Make the tensor name part clickable (the text node before the first child like checkbox)
+                // or make the whole li clickable excluding the checkbox.
+                // For simplicity, making text part after checkbox clickable.
+                // We find the text node that contains the tensor name.
+                // The structure is <input type="checkbox"> TensorName: [Shape]
+                // So, the tensor name is part of the li's text content not wrapped in its own element.
+                // We can add a click listener to the `li` and check if the target was not the checkbox.
+
                 li.style.cursor = 'pointer';
                 li.addEventListener('click', function(event) {
-                    event.preventDefault(); // If we wrap in <a> later
+                    if (event.target.name === 'tensor_compare_select') {
+                        // Click was on checkbox, let checkbox handler deal with it.
+                        return;
+                    }
+                    event.preventDefault();
 
-                    const name = this.textContent.split(':')[0].trim(); // Extract name from "Name: [shape]"
+                    const name = this.textContent.split(':')[0].trim().replace(/^.*?\}\s*/, ''); // More robust name extraction after checkbox
                     const shape = this.dataset.shape;
                     const dtype = this.dataset.dtype;
                     const preview = this.dataset.preview;
@@ -303,6 +393,31 @@
                     showTensorDetails(name, shape, dtype, preview);
                 });
             });
+        }
+
+        function updateCompareButtonState() {
+            const selectedCheckboxes = responseDisplay.querySelectorAll('input[name="tensor_compare_select"]:checked');
+            const count = selectedCheckboxes.length;
+            compareButton.textContent = `Compare Selected Tensors (${count})`;
+            compareButton.disabled = count !== 2;
+        }
+
+        function attachCheckboxListeners() {
+            const checkboxes = responseDisplay.querySelectorAll('input[name="tensor_compare_select"]');
+            if (checkboxes.length > 0) {
+                compareButtonContainer.style.display = 'block'; // Show compare button if there are tensors
+            } else {
+                compareButtonContainer.style.display = 'none';
+            }
+            checkboxes.forEach(checkbox => {
+                checkbox.addEventListener('change', updateCompareButtonState);
+            });
+            updateCompareButtonState(); // Initial state update
+        }
+
+        function setupTensorInteraction() {
+            attachTensorClickListeners();
+            attachCheckboxListeners();
         }
 
         // --- Modal Close Functionality ---
@@ -320,11 +435,139 @@
             }
         });
 
-        // Optional: Close modal with Escape key
+        // Optional: Close modal with Escape key - Extended for both modals
         document.addEventListener('keydown', (event) => {
-            if (event.key === 'Escape' && tensorModal.style.display === 'block') {
-                tensorModal.style.display = 'none';
+            if (event.key === 'Escape') {
+                if (tensorModal.style.display === 'block') {
+                    tensorModal.style.display = 'none';
+                }
+                if (comparisonModal.style.display === 'block') {
+                    comparisonModal.style.display = 'none';
+                }
             }
+        });
+
+        // --- Comparison Modal Close Functionality ---
+        closeComparisonModalButton.addEventListener('click', (event) => {
+            event.preventDefault();
+            comparisonModal.style.display = 'none';
+        });
+
+        comparisonModal.addEventListener('click', (event) => {
+            if (event.target === comparisonModal) { // Click on backdrop
+                comparisonModal.style.display = 'none';
+            }
+        });
+
+        // --- Comparison Logic ---
+        function parsePreviewString(previewStr) {
+            if (!previewStr || typeof previewStr !== 'string') return [];
+            // Remove brackets and "..."
+            let content = previewStr.replace(/^\[|\]$/g, '').replace(/,\s*\.\.\.$/, '');
+            if (content === "") return []; // Handle empty preview after stripping
+            return content.split(',').map(s => parseFloat(s.trim()));
+        }
+
+        function getTensorDataFromCheckbox(checkbox) {
+            const parentLi = checkbox.closest('li[data-tensor-id]');
+            if (!parentLi) return null;
+
+            const tensorId = parentLi.dataset.tensorId; // "filename::tensorname"
+            const parts = tensorId.split('::');
+            const filename = parts[0];
+            const tensorName = parts[1];
+
+            return {
+                id: tensorId,
+                name: tensorName,
+                filename: filename,
+                shape: parentLi.dataset.shape,
+                dtype: parentLi.dataset.dtype,
+                preview: parentLi.dataset.preview, // Raw preview string
+                previewArray: parsePreviewString(parentLi.dataset.preview) // Parsed numeric array
+            };
+        }
+
+        compareButton.addEventListener('click', () => {
+            const selectedCheckboxes = responseDisplay.querySelectorAll('input[name="tensor_compare_select"]:checked');
+            if (selectedCheckboxes.length !== 2) {
+                // Should not happen if button is correctly enabled/disabled, but as a safeguard:
+                alert("Please select exactly two tensors to compare.");
+                return;
+            }
+
+            const tensorAData = getTensorDataFromCheckbox(selectedCheckboxes[0]);
+            const tensorBData = getTensorDataFromCheckbox(selectedCheckboxes[1]);
+
+            if (!tensorAData || !tensorBData) {
+                alert("Could not retrieve data for one or both selected tensors.");
+                return;
+            }
+
+            // Populate Tensor A & B details
+            tensorAContent.innerHTML = `
+                <p><strong>Name:</strong> ${tensorAData.name}</p>
+                <p><strong>File:</strong> ${tensorAData.filename}</p>
+                <p><strong>Shape:</strong> ${tensorAData.shape}</p>
+                <p><strong>Data Type:</strong> ${tensorAData.dtype}</p>
+                <p><strong>Preview:</strong></p>
+                <pre>${tensorAData.preview}</pre>
+            `;
+            tensorBContent.innerHTML = `
+                <p><strong>Name:</strong> ${tensorBData.name}</p>
+                <p><strong>File:</strong> ${tensorBData.filename}</p>
+                <p><strong>Shape:</strong> ${tensorBData.shape}</p>
+                <p><strong>Data Type:</strong> ${tensorBData.dtype}</p>
+                <p><strong>Preview:</strong></p>
+                <pre>${tensorBData.preview}</pre>
+            `;
+
+            // Comparison Analysis
+            let analysisHTML = "";
+            if (tensorAData.shape !== tensorBData.shape) {
+                analysisHTML += `<p class="error-message">Tensors have different shapes: ${tensorAData.shape} vs ${tensorBData.shape}.</p>`;
+            }
+            if (tensorAData.dtype !== tensorBData.dtype) {
+                analysisHTML += `<p class="error-message">Tensors have different data types: ${tensorAData.dtype} vs ${tensorBData.dtype}.</p>`;
+            }
+
+            if (tensorAData.shape === tensorBData.shape && tensorAData.dtype === tensorBData.dtype) {
+                analysisHTML += `<p>Tensors have compatible shapes and data types.</p>`;
+                const previewA = tensorAData.previewArray;
+                const previewB = tensorBData.previewArray;
+
+                if (previewA.length > 0 && previewB.length > 0) {
+                    let differences = [];
+                    let maxLength = Math.max(previewA.length, previewB.length);
+                    let previewsMatch = true;
+                    for (let i = 0; i < maxLength; i++) {
+                        const valA = previewA[i];
+                        const valB = previewB[i];
+                        if (valA !== undefined && valB !== undefined) {
+                            differences.push((valA - valB).toPrecision(4));
+                            if (Math.abs(valA - valB) > 1e-6) previewsMatch = false; // Tolerance for float comparison
+                        } else {
+                            differences.push('N/A'); // Element exists in one but not the other
+                            previewsMatch = false;
+                        }
+                    }
+                    analysisHTML += `<p><strong>Preview Differences (A - B):</strong> <pre>[${differences.join(', ')}]</pre></p>`;
+                    if (previewsMatch && !(tensorAData.preview.includes("...") || tensorBData.preview.includes("..."))) {
+                         analysisHTML += `<p>Previews are numerically identical.</p>`;
+                    } else if (tensorAData.preview.includes("...") || tensorBData.preview.includes("...")) {
+                        analysisHTML += `<p>Note: Preview comparison is limited due to truncated data ("...").</p>`;
+                    } else {
+                        analysisHTML += `<p>Previews show numerical differences.</p>`;
+                    }
+                } else {
+                    analysisHTML += `<p>Preview data not available or empty for one or both tensors; cannot compare numerically.</p>`;
+                }
+            } else {
+                 analysisHTML += `<p>Cannot perform numerical comparison due to incompatible shapes or data types.</p>`;
+            }
+
+            analysisContent.innerHTML = analysisHTML;
+            comparisonModal.style.display = 'block';
         });
     </script>
 </body>
