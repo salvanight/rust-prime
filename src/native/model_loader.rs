@@ -23,6 +23,7 @@ type SafeTensorHeader = HashMap<String, TensorMetadata>;
 pub enum ModelLoaderError {
     IoError(io::Error),
     JsonError(serde_json::Error),
+    ConfigError(String),
     UnsupportedDtype(String),
     DataCorruption(String),
     HeaderTooShort,
@@ -35,6 +36,7 @@ impl std::fmt::Display for ModelLoaderError {
         match self {
             ModelLoaderError::IoError(e) => write!(f, "IO error: {}", e),
             ModelLoaderError::JsonError(e) => write!(f, "JSON parsing error: {}", e),
+            ModelLoaderError::ConfigError(s) => write!(f, "Config error: {}", s),
             ModelLoaderError::UnsupportedDtype(s) => write!(f, "Unsupported dtype: {}", s),
             ModelLoaderError::DataCorruption(s) => write!(f, "Data corruption: {}", s),
             ModelLoaderError::HeaderTooShort => write!(f, "Header is too short"),
@@ -49,6 +51,7 @@ impl std::error::Error for ModelLoaderError {
         match self {
             ModelLoaderError::IoError(ref e) => Some(e),
             ModelLoaderError::JsonError(ref e) => Some(e),
+            ModelLoaderError::ConfigError(_) => None,
             _ => None,
         }
     }
@@ -65,6 +68,13 @@ impl From<serde_json::Error> for ModelLoaderError {
     fn from(err: serde_json::Error) -> ModelLoaderError {
         ModelLoaderError::JsonError(err)
     }
+}
+
+/// Load a transformer configuration JSON file and convert it to the internal
+/// `Config` used by `transformer_core`.
+pub fn load_config(path: &str) -> Result<crate::native::transformer_core::Config, ModelLoaderError> {
+    crate::native::transformer_core::Config::from_json_file(path)
+        .map_err(|e| ModelLoaderError::ConfigError(e.to_string()))
 }
 
 // 2. Implement .safetensors Parser

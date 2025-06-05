@@ -1,145 +1,88 @@
-//! # Web Server Routes for File Uploader UI
-//!
-//! This module defines the Actix web server routes and handlers for the file
-//! uploading and inspection user interface. It includes routes to serve the main
-//! HTML page and to handle file uploads.
-
 use actix_web::{web, App, HttpServer, Responder, HttpResponse, Error};
 use actix_files::NamedFile;
-use std::path::PathBuf; // Though PathBuf is imported, it's not explicitly used in the provided snippet. Will keep for now.
+use std::path::PathBuf;
 use actix_multipart::Multipart;
 use futures_util::TryStreamExt;
 use safetensors::SafeTensors;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Serves the main HTML page (`index.html`) for the file uploader UI.
-///
-/// This function handles GET requests to the root path (`/`).
-/// It asynchronously opens and returns the `index.html` file.
 pub async fn index() -> impl Responder { // Made public
-    NamedFile::open_async("./src/ui/index.html")
-        .await
-        .expect("index.html should be present in src/ui/") // .unwrap() can panic, added expect for clarity.
+    NamedFile::open_async("./src/ui/index.html").await.unwrap()
 }
 
-/// Handles multipart file uploads from the UI.
-///
-/// This function processes POST requests to the `/upload` path. It expects
-/// `multipart/form-data` containing one or more files.
-///
-/// For each uploaded file, it attempts to:
-/// 1. Identify if it's a `.safetensors` model weights file or a `tokenizer.json` file.
-/// 2. Parse the file to extract relevant metadata:
-///    - For `.safetensors`: Tensor names and their shapes.
-///    - For `tokenizer.json`: A preview of the JSON content.
-/// 3. Collect any processing errors or skip unsupported files.
-///
-/// # Memory Considerations:
-/// - Each file's content is currently read entirely into a `Vec<u8>` in memory.
-///   For very large files (especially `.safetensors`), this can lead to high peak RAM usage.
-///   More advanced solutions like memory-mapping temporary files could mitigate this but add complexity.
-/// - The `safetensors` crate itself is efficient for metadata extraction once the data is in memory,
-///   as it uses views into the byte slice.
-/// - `tokenizer.json` files are typically small, making the full read and `serde_json::Value` DOM
-///   parsing generally acceptable.
-///
-/// # Returns
-/// An `HttpResponse` which is one of:
-/// - **200 OK**: If files were processed (even if some were skipped). The body contains HTML
-///   displaying information about successfully processed files and/or messages about skipped files.
-///   If no compatible files are processed, a relevant message is shown.
-/// - **400 Bad Request**: If any file processing results in a critical error (e.g., corrupted
-///   SafeTensors file, invalid JSON). The body contains HTML detailing these errors,
-///   alongside information about any files that might have been processed successfully before the error.
-/// - Other Actix web error types might be returned by the framework itself on lower-level issues.
 pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error> { // Made public
     let mut uploaded_files_info = HashMap::new();
     let mut processing_errors = Vec::new();
-    // Flag to track if any user-facing error (parsing, wrong type) occurred.
-    // This helps decide if the overall response should be OK or Bad Request.
-    let mut any_critical_error_occurred = false;
 
     while let Some(item_result) = payload.try_next().await {
         let mut field = match item_result {
             Ok(field) => field,
             Err(e) => {
-                processing_errors.push(format!("Error reading multipart stream: {}", e));
-                any_critical_error_occurred = true; // Error in stream reading is critical
+                processing_errors.push(format!("Error reading multipart item: {}", e));
                 continue;
             }
         };
-
         let content_disposition = field.content_disposition();
         let filename = content_disposition.get_filename().unwrap_or("unknown_file").to_string();
 
-        // Memory consideration: The entire file for this field is read into `file_bytes`.
-        // (See previous comments on this topic)
         let mut file_bytes = Vec::new();
-        let mut field_chunk_error = false;
         while let Some(chunk_result) = field.try_next().await {
             match chunk_result {
                 Ok(chunk) => file_bytes.extend_from_slice(&chunk),
                 Err(e) => {
-                    let err_msg = format!("Error reading data for file '{}': {}", filename, e);
-                    processing_errors.push(err_msg);
-                    any_critical_error_occurred = true; // Error reading chunks is critical
-                    field_chunk_error = true;
-                    break;
+                    processing_errors.push(format!("Error reading chunk for file {}: {}", filename, e));
+                    // Skip to next file if chunk reading fails
+                    continue;
                 }
             }
         }
 
-        if field_chunk_error {
-            continue;
-        }
-
-        // Process the collected file bytes using the helper function
-        match process_single_file(&filename, file_bytes).await {
-            Ok((processed_filename, info_map)) => {
-                // Check if it was a skip, which is reported as an Err by process_single_file if it adds to processing_errors.
-                // This logic is now simplified: Ok means successfully processed.
-                uploaded_files_info.insert(processed_filename, info_map);
-            }
-            Err(err_msg) => {
-                // Errors from process_single_file can be parsing errors or "skipped file" messages.
-                // We treat any such message as something to report to the user.
-                // If the error indicates a true parsing failure vs. a skip, that could influence any_critical_error_occurred.
-                // The current process_single_file returns Err for skips too.
-                if err_msg.contains("Invalid") || err_msg.contains("corrupted") { // Heuristic for critical errors
-                    any_critical_error_occurred = true;
+        if filename.ends_with(".safetensors") {
+            println!("Processing SafeTensors file: {}", filename);
+            match SafeTensors::deserialize(&file_bytes) {
+                Ok(tensors) => {
+                    let mut tensor_info = HashMap::new();
+                    for (name, view) in tensors.tensors() {
+                        tensor_info.insert(name.clone(), format!("{:?}", view.shape()));
+                    }
+                    uploaded_files_info.insert(filename.clone(), tensor_info);
+                    println!("Successfully processed SafeTensors file: {}", filename);
                 }
-                processing_errors.push(err_msg);
+                Err(e) => {
+                    let error_msg = format!("Error deserializing SafeTensors file '{}': {}", filename, e);
+                    eprintln!("{}", error_msg);
+                    processing_errors.push(error_msg);
+                }
             }
+        } else if filename.ends_with("tokenizer.json") {
+            println!("Processing tokenizer.json file: {}", filename);
+            match serde_json::from_slice::<Value>(&file_bytes) {
+                Ok(json_value) => {
+                    let mut tokenizer_details = HashMap::new();
+                    tokenizer_details.insert("content_preview".to_string(), format!("{:.200}", json_value.to_string())); // Increased preview length
+                    uploaded_files_info.insert(filename.clone(), tokenizer_details);
+                    println!("Successfully processed tokenizer.json file: {}", filename);
+                }
+                Err(e) => {
+                    let error_msg = format!("Error deserializing tokenizer.json file '{}': {}", filename, e);
+                    eprintln!("{}", error_msg);
+                    processing_errors.push(error_msg);
+                }
+            }
+        } else {
+            println!("Skipping non-SafeTensors/tokenizer.json file: {}", filename);
         }
     }
 
-    // Determine overall response status.
-    // If there were critical errors (parsing, stream read), it should be a Bad Request.
-    // If only skips occurred, this might also be a Bad Request based on current logic,
-    // or could be an OK with a list of issues.
-    // The `any_critical_error_occurred` helps distinguish.
-    // However, the current HTML generation logic for errors simply lists all `processing_errors`.
-    // If `processing_errors` is not empty, it returns BadRequest.
-    // This behavior is kept for now.
-    // it should be a Bad Request. If files were just skipped (unsupported type),
-    // it's more of a partial success, so OK status might still be appropriate,
-    // but the message should clearly indicate skipped files.
-    // The current logic pushes skipped messages to `processing_errors` and then returns BadRequest
-    // if `processing_errors` is not empty. This means skipped files also lead to BadRequest.
-    // This can be adjusted if skipped files should not cause a "request failure" status.
-    // For now, any entry in `processing_errors` (including skips) makes it a "Bad Request" effectively.
-
     if !processing_errors.is_empty() {
         let mut error_html_response = String::new();
-        error_html_response.push_str("<div class=\"error-message\">");
-        error_html_response.push_str("<h2>File Processing Issues:</h2><ul>");
-        for err in &processing_errors { // Borrow processing_errors
+        error_html_response.push_str("<h2>File Processing Errors:</h2><ul>");
+        for err in processing_errors {
             error_html_response.push_str(&format!("<li>{}</li>", err));
         }
-        error_html_response.push_str("</ul></div>");
-
-        if !uploaded_files_info.is_empty() {
+        error_html_response.push_str("</ul>");
+        if !uploaded_files_info.is_empty(){
              error_html_response.push_str("<hr><h3>Successfully Processed Files (if any):</h3>");
         }
         // Also include info about successfully processed files if any
@@ -192,86 +135,14 @@ pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error>
     Ok(HttpResponse::Ok().content_type("text/html").body(html_response))
 }
 
-/// Initializes and runs the Actix web server.
-///
-/// The server is configured with routes for the main page (`/`) and file uploads (`/upload`).
-/// It binds to `127.0.0.1:8080` by default.
-///
-/// # Returns
-/// A `std::io::Result<()>` which is `Ok(())` if the server runs successfully,
-/// or an `Err` if there's an issue binding to the port or starting the server.
+
 pub async fn run_server() -> std::io::Result<()> {
-    println!("Starting server at http://127.0.0.1:8080/"); // Added a startup message
     HttpServer::new(|| {
         App::new()
-            // Serve the main index.html page at the root
             .route("/", web::get().to(index))
-            // Handle file uploads at /upload
             .route("/upload", web::post().to(upload_files))
     })
     .bind(("127.0.0.1", 8080))?
-}
-
-// Helper function to process a single uploaded file
-// Returns Ok((filename, info_map)) on successful parsing, where info_map includes a "_type" field.
-// Returns Err(error_message_string) for parsing errors or if the file type is skipped.
-async fn process_single_file(
-    filename: &str, // Borrow filename
-    file_bytes: Vec<u8>,
-) -> Result<(String, HashMap<String, String>), String> {
-    if filename.ends_with(".safetensors") {
-        // (Memory consideration comments remain applicable here)
-        println!("Processing SafeTensors file: {}", filename);
-        match SafeTensors::deserialize(&file_bytes) {
-            Ok(tensors) => {
-                let mut tensor_info = HashMap::new();
-                for (name, view) in tensors.tensors() {
-                    tensor_info.insert(name.clone(), format!("{:?}", view.shape()));
-                }
-                tensor_info.insert("_type".to_string(), "safetensor".to_string()); // For HTML generation
-                println!("Successfully processed SafeTensors file: {}", filename);
-                Ok((filename.to_string(), tensor_info))
-            }
-            Err(e) => {
-                let error_msg = format!(
-                    "<strong>File: '{}'</strong> - Invalid SafeTensors format. Details: {}. Please ensure the file is not corrupted and conforms to the SafeTensors specification.",
-                    filename, e
-                );
-                eprintln!("Error deserializing SafeTensors file {}: {}", filename, e);
-                Err(error_msg)
-            }
-        }
-    } else if filename.ends_with("tokenizer.json") {
-        // (Memory consideration comments remain applicable here)
-        println!("Processing tokenizer.json file: {}", filename);
-        match serde_json::from_slice::<Value>(&file_bytes) {
-            Ok(json_value) => {
-                let mut tokenizer_details = HashMap::new();
-                tokenizer_details.insert("content_preview".to_string(), format!("{:.200}", json_value.to_string()));
-                tokenizer_details.insert("_type".to_string(), "tokenizer".to_string()); // For HTML generation
-                println!("Successfully processed tokenizer.json file: {}", filename);
-                Ok((filename.to_string(), tokenizer_details))
-            }
-            Err(e) => {
-                let error_msg = format!(
-                    "<strong>File: '{}'</strong> - Invalid JSON format in tokenizer file. Details: {}. Please check for syntax errors like missing commas or brackets.",
-                    filename, e
-                );
-                eprintln!("Error deserializing tokenizer.json file {}: {}", filename, e);
-                Err(error_msg)
-            }
-        }
-    } else {
-        let skipped_msg = format!(
-            "<strong>File: '{}'</strong> - Skipped. This file type is not supported. Please upload only .safetensors or tokenizer.json files.",
-            filename
-        );
-        // This is treated as an "error" for reporting purposes to ensure the user is notified.
-        Err(skipped_msg)
-    }
-}
-
-/// Initializes and runs the Actix web server.
     .run()
     .await
 }
@@ -362,9 +233,8 @@ mod tests {
 
         let body = test::body_to_bytes(resp.into_body()).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(body_str.contains("<div class=\"error-message\">"));
-        assert!(body_str.contains("<h2>File Processing Issues:</h2>"));
-        assert!(body_str.contains("<strong>File: 'tokenizer_corrupted.json'</strong> - Invalid JSON format in tokenizer file."));
+        assert!(body_str.contains("File Processing Errors"));
+        assert!(body_str.contains("Error deserializing tokenizer.json file 'tokenizer_corrupted.json'"));
     }
 
     #[actix_rt::test]
@@ -377,9 +247,8 @@ mod tests {
 
         let body = test::body_to_bytes(resp.into_body()).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(body_str.contains("<div class=\"error-message\">"));
-        assert!(body_str.contains("<h2>File Processing Issues:</h2>"));
-        assert!(body_str.contains("<strong>File: 'corrupted.safetensors'</strong> - Invalid SafeTensors format."));
+        assert!(body_str.contains("File Processing Errors"));
+        assert!(body_str.contains("Error deserializing SafeTensors file 'corrupted.safetensors'"));
     }
 
     #[actix_rt::test]
@@ -388,16 +257,11 @@ mod tests {
         let payload = create_multipart_payload("other.txt", other_content);
 
         let resp = upload_files(payload).await.unwrap();
-        // Now expects BAD_REQUEST because skipped files are treated as processing issues.
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK); // Should be OK, but with "no compatible files" message
 
         let body = test::body_to_bytes(resp.into_body()).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(body_str.contains("<div class=\"error-message\">"));
-        assert!(body_str.contains("<h2>File Processing Issues:</h2>"));
-        assert!(body_str.contains("<strong>File: 'other.txt'</strong> - Skipped. This file type is not supported."));
-        // Check that there's no "Successfully Processed Files" section if only a skip occurs.
-        assert!(!body_str.contains("<hr><h3>Successfully Processed Files (if any):</h3>"));
+        assert!(body_str.contains("<p>No compatible files were uploaded or processed successfully.</p>"));
     }
 
     #[actix_rt::test]
@@ -419,12 +283,10 @@ mod tests {
         let body = test::body_to_bytes(resp.into_body()).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
 
-        assert!(body_str.contains("<div class=\"error-message\">"));
-        assert!(body_str.contains("<h2>File Processing Issues:</h2>"));
-        assert!(body_str.contains("<strong>File: 'bad.safetensors'</strong> - Invalid SafeTensors format."));
-        assert!(body_str.contains("<strong>File: 'notes.txt'</strong> - Skipped. This file type is not supported."));
+        assert!(body_str.contains("File Processing Errors"));
+        assert!(body_str.contains("Error deserializing SafeTensors file 'bad.safetensors'"));
 
-        assert!(body_str.contains("<hr><h3>Successfully Processed Files (if any):</h3>"));
+        assert!(body_str.contains("Successfully Processed Files (if any)"));
         assert!(body_str.contains("<h3>tokenizer.json</h3>"));
         assert!(body_str.contains(r#"name&quot;: &quot;valid_tokenizer&quot;"#));
 

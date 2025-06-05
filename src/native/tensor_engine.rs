@@ -733,12 +733,6 @@ impl Tensor<f32> {
     }
 
     pub fn softmax(&self, axis: usize) -> Result<Tensor<f32>, TensorError> {
-            }
-        }
-        Tensor::new(result_data, vec![m, n])
-    }
-
-    pub fn softmax(&self, axis: usize) -> Result<Tensor<f32>, TensorError> {
         if axis >= self.rank() {
             return Err(TensorError::UnsupportedAxis(format!(
                 "Axis {} is out of bounds for tensor with rank {}",

@@ -4,6 +4,10 @@ use super::tensor_engine::{Tensor, TensorError};
 use std::collections::HashMap;
 use rayon::prelude::*;
 use std::sync::Arc;
+use serde::Deserialize;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 // 0. Basic Setup
 #[derive(Debug)]
@@ -59,13 +63,127 @@ pub struct Config {
 
 impl Config {
     pub fn head_dim(&self) -> usize {
-        if self.n_embd == 0 || self.n_head == 0 { 
+        if self.n_embd == 0 || self.n_head == 0 {
             return 0;
         }
         if self.n_embd % self.n_head != 0 {
             eprintln!("Warning: n_embd {} is not divisible by n_head {}. Head dimension may be incorrect.", self.n_embd, self.n_head);
         }
         self.n_embd / self.n_head
+    }
+
+    /// Load a configuration from a JSON file.  The loader will attempt to
+    /// determine the architecture (e.g. GPT-2 vs BERT) based on fields like
+    /// `model_type` or `architectures` and map them to the internal `Config`
+    /// representation used by the transformer core.
+    pub fn from_json_file<P: AsRef<Path>>(path: P) -> Result<Self, TransformerError> {
+        let path_ref = path.as_ref();
+        let mut file = File::open(path_ref).map_err(|e| {
+            TransformerError::ConfigError(format!("Failed to open config {:?}: {}", path_ref, e))
+        })?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).map_err(|e| {
+            TransformerError::ConfigError(format!("Failed to read config {:?}: {}", path_ref, e))
+        })?;
+        Self::from_json_str(&contents)
+    }
+
+    /// Parse a JSON string into a `Config`.  This is used internally by
+    /// `from_json_file` but can also be useful for tests.
+    pub fn from_json_str(json_str: &str) -> Result<Self, TransformerError> {
+        #[derive(Deserialize)]
+        struct RawConfig {
+            model_type: Option<String>,
+            architectures: Option<Vec<String>>, // e.g. ["GPT2LMHeadModel"]
+            n_layer: Option<usize>,
+            num_hidden_layers: Option<usize>,
+            n_head: Option<usize>,
+            num_attention_heads: Option<usize>,
+            n_embd: Option<usize>,
+            hidden_size: Option<usize>,
+            vocab_size: Option<usize>,
+            n_ctx: Option<usize>,
+            n_positions: Option<usize>,
+            max_position_embeddings: Option<usize>,
+        }
+
+        let raw: RawConfig = serde_json::from_str(json_str).map_err(|e| {
+            TransformerError::ConfigError(format!("Failed to parse config JSON: {}", e))
+        })?;
+
+        // Determine architecture either via `model_type` or `architectures`
+        let model_type = raw
+            .model_type
+            .as_deref()
+            .or_else(|| raw.architectures.as_ref().and_then(|v| v.get(0).map(|s| s.as_str())))
+            .unwrap_or("gpt2");
+
+        match model_type.to_lowercase().as_str() {
+            "gpt2" | "gpt_neo" | "gptj" => Self::from_gpt_like(raw),
+            "bert" => Self::from_bert_like(raw),
+            other => Err(TransformerError::UnsupportedOperation(format!(
+                "Unsupported model type: {}",
+                other
+            ))),
+        }
+    }
+
+    fn from_gpt_like(raw: RawConfig) -> Result<Self, TransformerError> {
+        let n_layer = raw.n_layer.or(raw.num_hidden_layers).ok_or_else(|| {
+            TransformerError::ConfigError("Missing n_layer/num_hidden_layers".to_string())
+        })?;
+        let n_head = raw.n_head.or(raw.num_attention_heads).ok_or_else(|| {
+            TransformerError::ConfigError("Missing n_head/num_attention_heads".to_string())
+        })?;
+        let n_embd = raw.n_embd.or(raw.hidden_size).ok_or_else(|| {
+            TransformerError::ConfigError("Missing n_embd/hidden_size".to_string())
+        })?;
+        let vocab_size = raw.vocab_size.ok_or_else(|| {
+            TransformerError::ConfigError("Missing vocab_size".to_string())
+        })?;
+        let block_size = raw
+            .n_ctx
+            .or(raw.n_positions)
+            .or(raw.max_position_embeddings)
+            .ok_or_else(|| TransformerError::ConfigError("Missing block size".to_string()))?;
+
+        Ok(Config {
+            n_layer,
+            n_head,
+            n_embd,
+            vocab_size,
+            block_size,
+            bias: true,
+        })
+    }
+
+    fn from_bert_like(raw: RawConfig) -> Result<Self, TransformerError> {
+        let n_layer = raw.num_hidden_layers.or(raw.n_layer).ok_or_else(|| {
+            TransformerError::ConfigError("Missing num_hidden_layers".to_string())
+        })?;
+        let n_head = raw.num_attention_heads.or(raw.n_head).ok_or_else(|| {
+            TransformerError::ConfigError("Missing num_attention_heads".to_string())
+        })?;
+        let n_embd = raw.hidden_size.or(raw.n_embd).ok_or_else(|| {
+            TransformerError::ConfigError("Missing hidden_size".to_string())
+        })?;
+        let vocab_size = raw.vocab_size.ok_or_else(|| {
+            TransformerError::ConfigError("Missing vocab_size".to_string())
+        })?;
+        let block_size = raw
+            .max_position_embeddings
+            .or(raw.n_positions)
+            .or(raw.n_ctx)
+            .ok_or_else(|| TransformerError::ConfigError("Missing max_position_embeddings".to_string()))?;
+
+        Ok(Config {
+            n_layer,
+            n_head,
+            n_embd,
+            vocab_size,
+            block_size,
+            bias: true,
+        })
     }
 }
 

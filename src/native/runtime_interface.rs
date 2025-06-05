@@ -29,7 +29,11 @@ struct CliArgs {
     #[clap(long, value_parser, default_value_t = 50256)] // Default EOS for GPT-2
     eos_token_id: u32,
 
-    // Model Configuration Arguments
+    /// Optional path to a JSON configuration file (e.g. HuggingFace `config.json`).
+    #[clap(long, value_parser)]
+    config_path: Option<String>,
+
+    // Legacy config flags (retained for backward compatibility)
     #[clap(long, value_parser, default_value_t = 12)]
     config_n_layer: usize,
     #[clap(long, value_parser, default_value_t = 12)]
@@ -40,9 +44,6 @@ struct CliArgs {
     config_vocab_size: usize,
     #[clap(long, value_parser, default_value_t = 1024)]
     config_block_size: usize,
-    // Note: The 'bias' field in Config (true/false) is not easily set via CLI flag without more complex parsing.
-    // For now, we'll assume 'bias: true' as is typical for GPT-2.
-    // A production CLI might use `--no-bias` or parse "true"/"false".
 }
 
 // Custom error wrapper to combine various error types
@@ -123,13 +124,18 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
     let weights_map = model_loader::load_safetensors(&args.model_path).map_err(RuntimeError::from)?;
     println!("Model weights loaded.");
 
-    let config = transformer_core::Config {
-        n_layer: args.config_n_layer,
-        n_head: args.config_n_head,
-        n_embd: args.config_n_embd,
-        vocab_size: args.config_vocab_size,
-        block_size: args.config_block_size,
-        bias: true, // Assuming bias is true, as typical for GPT-2.
+    let config = if let Some(cfg_path) = args.config_path.as_deref() {
+        println!("Loading model configuration from {}", cfg_path);
+        transformer_core::Config::from_json_file(cfg_path).map_err(RuntimeError::from)?
+    } else {
+        transformer_core::Config {
+            n_layer: args.config_n_layer,
+            n_head: args.config_n_head,
+            n_embd: args.config_n_embd,
+            vocab_size: args.config_vocab_size,
+            block_size: args.config_block_size,
+            bias: true,
+        }
     };
     println!("Model configuration prepared: {:?}", config);
 
