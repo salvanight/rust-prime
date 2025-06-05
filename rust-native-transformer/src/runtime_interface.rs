@@ -8,7 +8,6 @@ use crate::tensor_engine; // Not directly used here, but good to have if errors 
 use crate::text_generator;
 use crate::tokenizer_core;
 use crate::transformer_core;
-use crate::training;
 // use crate::resonance_feedback::{ResonanceFeedbackStore, ExperienceEntry, ValidationStatus}; // Added
 // use uuid; // Added for direct UUID usage if ExperienceEntry::new() doesn't set it (it does)
 
@@ -29,9 +28,6 @@ struct CliArgs {
     max_length: usize,
     #[clap(long, value_parser, default_value_t = 50256)] // Default EOS for GPT-2
     eos_token_id: u32,
-
-    #[clap(long, value_parser, default_value = "inference")]
-    mode: String,
 
     // Model Configuration Arguments
     #[clap(long, value_parser, default_value_t = 12)]
@@ -137,7 +133,7 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
     };
     println!("Model configuration prepared: {:?}", config);
 
-    let mut model = transformer_core::GPT2Model::new(config, weights_map).map_err(RuntimeError::from)?;
+    let model = transformer_core::GPT2Model::new(config, weights_map).map_err(RuntimeError::from)?;
     println!("GPT-2 Model instantiated.");
 
     // 4. Tokenize Prompt
@@ -157,17 +153,6 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
     }
     println!("Prompt token IDs: {:?}", input_ids);
     
-    if args.mode.to_lowercase() == "training" {
-        let mut targets = input_ids[1..].to_vec();
-        targets.push(args.eos_token_id);
-        let input_tensor = tensor_engine::Tensor::new(input_ids.clone(), vec![1, input_ids.len()])?;
-        let target_tensor = tensor_engine::Tensor::new(targets, vec![1, input_tensor.shape[1]])?;
-        let optimizer = training::SGDOptimizer { learning_rate: 0.001 };
-        let loss = training::train_step(&mut model, &input_tensor, &target_tensor, &optimizer).map_err(RuntimeError::from)?;
-        println!("Training step completed. Loss: {}", loss);
-        return Ok(());
-    }
-
     // 5. Generate Text
     println!("Generating text (max_length: {}, eos_token_id: {})...", args.max_length, args.eos_token_id);
     let generated_ids = text_generator::generate(
@@ -176,6 +161,7 @@ pub fn run_cli() -> Result<(), Box<dyn Error>> {
         args.max_length,
         args.eos_token_id,
         None
+        // Some(&feedback_store) // Pass the feedback store
     ).map_err(RuntimeError::from)?;
     println!("Generated token IDs: {:?}", generated_ids);
 
