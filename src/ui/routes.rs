@@ -12,6 +12,7 @@ use futures_util::TryStreamExt;
 use safetensors::SafeTensors;
 use serde_json::Value;
 use std::collections::HashMap;
+use html_escape;
 
 /// Serves the main HTML page (`index.html`) for the file uploader UI.
 ///
@@ -146,13 +147,30 @@ pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error>
         // This part is similar to the success case but appended to the error message
          for (filename, info) in &uploaded_files_info {
             error_html_response.push_str(&format!("<h4>{}</h4>", filename));
-            if filename.ends_with(".safetensors") {
+            if info.get("_type").map_or(false, |t| t == "safetensor") {
                 error_html_response.push_str("<ul>");
-                for (name, shape) in info {
-                    error_html_response.push_str(&format!("<li>Tensor: {}, Shape: {}</li>", name, shape));
+                let mut tensor_names = info.keys()
+                    .filter_map(|k| k.split('.').next())
+                    .filter(|&k| k != "_type")
+                    .collect::<Vec<_>>();
+                tensor_names.sort();
+                tensor_names.dedup();
+
+                for name in tensor_names {
+                    let shape = info.get(&format!("{}.shape", name)).unwrap_or(&"N/A".to_string());
+                    let dtype = info.get(&format!("{}.dtype", name)).unwrap_or(&"N/A".to_string());
+                    let preview = info.get(&format!("{}.preview", name)).unwrap_or(&"N/A".to_string());
+                    // Basic HTML escaping for attribute values, especially preview
+                    let preview_escaped = html_escape::encode_double_quoted_attribute(preview);
+                    let shape_escaped = html_escape::encode_double_quoted_attribute(shape); // Also escape shape
+
+                    error_html_response.push_str(&format!(
+                        "<li data-dtype=\"{}\" data-preview=\"{}\" data-shape=\"{}\">{}: {}</li>",
+                        dtype, preview_escaped, shape_escaped, name, shape
+                    ));
                 }
                 error_html_response.push_str("</ul>");
-            } else if filename.ends_with("tokenizer.json") {
+            } else if info.get("_type").map_or(false, |t| t == "tokenizer") {
                 error_html_response.push_str("<pre>");
                 for (key, value) in info {
                     if key == "content_preview" {
@@ -167,18 +185,41 @@ pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error>
 
     let mut html_response = String::new();
     if uploaded_files_info.is_empty() {
-        html_response.push_str("<p>No compatible files were uploaded or processed successfully.</p>");
+        // This case might be hit if only non-supported files were uploaded, leading to processing_errors
+        // but no items in uploaded_files_info. The error block above handles showing those errors.
+        // If processing_errors is also empty, it means no files were uploaded or they were empty.
+        if processing_errors.is_empty() { // Only show this if there were no errors reported either
+            html_response.push_str("<p>No files were uploaded or processed.</p>");
+        }
     } else {
         html_response.push_str("<h2>Uploaded File Information:</h2>");
         for (filename, info) in uploaded_files_info {
             html_response.push_str(&format!("<h3>{}</h3>", filename));
-            if filename.ends_with(".safetensors") {
+            if info.get("_type").map_or(false, |t| t == "safetensor") {
                 html_response.push_str("<ul>");
-                for (name, shape) in info {
-                    html_response.push_str(&format!("<li>Tensor: {}, Shape: {}</li>", name, shape));
+                // Extract tensor names, sort for consistent order
+                let mut tensor_names = info.keys()
+                    .filter_map(|k| k.split('.').next())
+                    .filter(|&k| k != "_type") // Exclude the internal type hint
+                    .collect::<Vec<_>>();
+                tensor_names.sort();
+                tensor_names.dedup();
+
+                for name in tensor_names {
+                    let shape = info.get(&format!("{}.shape", name)).unwrap_or(&"N/A".to_string());
+                    let dtype = info.get(&format!("{}.dtype", name)).unwrap_or(&"N/A".to_string());
+                    let preview = info.get(&format!("{}.preview", name)).unwrap_or(&"N/A".to_string());
+                    // Basic HTML escaping for attribute values, especially preview
+                    let preview_escaped = html_escape::encode_double_quoted_attribute(preview);
+                    let shape_escaped = html_escape::encode_double_quoted_attribute(shape); // Also escape shape
+
+                    html_response.push_str(&format!(
+                        "<li data-dtype=\"{}\" data-preview=\"{}\" data-shape=\"{}\">{}: {}</li>",
+                        dtype, preview_escaped, shape_escaped, name, shape
+                    ));
                 }
                 html_response.push_str("</ul>");
-            } else if filename.ends_with("tokenizer.json") {
+            } else if info.get("_type").map_or(false, |t| t == "tokenizer") {
                 html_response.push_str("<pre>");
                 for (key, value) in info {
                     if key == "content_preview" {
@@ -200,8 +241,9 @@ pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error>
 /// # Returns
 /// A `std::io::Result<()>` which is `Ok(())` if the server runs successfully,
 /// or an `Err` if there's an issue binding to the port or starting the server.
-pub async fn run_server() -> std::io::Result<()> {
-    println!("Starting server at http://127.0.0.1:8080/"); // Added a startup message
+pub async fn run_server(port: u16) -> std::io::Result<()> {
+    let server_address = format!("127.0.0.1:{}", port);
+    println!("Starting server at http://{}/", server_address);
     HttpServer::new(|| {
         App::new()
             // Serve the main index.html page at the root
@@ -209,7 +251,7 @@ pub async fn run_server() -> std::io::Result<()> {
             // Handle file uploads at /upload
             .route("/upload", web::post().to(upload_files))
     })
-    .bind(("127.0.0.1", 8080))?
+    .bind(server_address)?
 }
 
 // Helper function to process a single uploaded file
@@ -218,19 +260,64 @@ pub async fn run_server() -> std::io::Result<()> {
 async fn process_single_file(
     filename: &str, // Borrow filename
     file_bytes: Vec<u8>,
-) -> Result<(String, HashMap<String, String>), String> {
+) -> Result<(String, HashMap<String, String>), String> { // Value of HashMap is String, so details will be stringified.
     if filename.ends_with(".safetensors") {
         // (Memory consideration comments remain applicable here)
         println!("Processing SafeTensors file: {}", filename);
         match SafeTensors::deserialize(&file_bytes) {
-            Ok(tensors) => {
-                let mut tensor_info = HashMap::new();
-                for (name, view) in tensors.tensors() {
-                    tensor_info.insert(name.clone(), format!("{:?}", view.shape()));
+            Ok(tensors_metadata) => { // Renamed for clarity, this is metadata access
+                let mut file_specific_info = HashMap::new();
+                file_specific_info.insert("_type".to_string(), "safetensor".to_string());
+
+                for (tensor_name, tensor_view) in tensors_metadata.tensors() {
+                    let shape_str = format!("{:?}", tensor_view.shape());
+                    let dtype_str = format!("{:?}", tensor_view.dtype()); // DType to String
+
+                    // Preview generation
+                    const MAX_PREVIEW_ELEMENTS: usize = 10;
+                    let data_slice = tensor_view.data();
+                    let mut preview_str = "[".to_string();
+
+                    match tensor_view.dtype() {
+                        safetensors::Dtype::F32 => {
+                            let typed_data: &[f32] = bytemuck::cast_slice(data_slice);
+                            for (i, val) in typed_data.iter().take(MAX_PREVIEW_ELEMENTS).enumerate() {
+                                if i > 0 { preview_str.push_str(", "); }
+                                preview_str.push_str(&format!("{:.4}", val));
+                            }
+                            if typed_data.len() > MAX_PREVIEW_ELEMENTS { preview_str.push_str(", ..."); }
+                        }
+                        safetensors::Dtype::I64 => {
+                            let typed_data: &[i64] = bytemuck::cast_slice(data_slice);
+                            for (i, val) in typed_data.iter().take(MAX_PREVIEW_ELEMENTS).enumerate() {
+                                if i > 0 { preview_str.push_str(", "); }
+                                preview_str.push_str(&val.to_string());
+                            }
+                            if typed_data.len() > MAX_PREVIEW_ELEMENTS { preview_str.push_str(", ..."); }
+                        }
+                        safetensors::Dtype::U8 => {
+                            // Note: U8 can be raw bytes or actual uint8 data. Assuming numeric for preview.
+                            for (i, val) in data_slice.iter().take(MAX_PREVIEW_ELEMENTS).enumerate() {
+                                if i > 0 { preview_str.push_str(", "); }
+                                preview_str.push_str(&val.to_string());
+                            }
+                            if data_slice.len() > MAX_PREVIEW_ELEMENTS { preview_str.push_str(", ..."); }
+                        }
+                        // Add other Dtypes as needed: F64, I32, U32, BF16, F16, etc.
+                        // For unsupported DTypes for preview, or if data_slice is not aligned:
+                        _ => {
+                            preview_str.push_str("Preview not available for this dtype or data is misaligned");
+                        }
+                    }
+                    preview_str.push(']');
+
+                    file_specific_info.insert(format!("{}.shape", tensor_name), shape_str);
+                    file_specific_info.insert(format!("{}.dtype", tensor_name), dtype_str);
+                    file_specific_info.insert(format!("{}.preview", tensor_name), preview_str);
                 }
-                tensor_info.insert("_type".to_string(), "safetensor".to_string()); // For HTML generation
+
                 println!("Successfully processed SafeTensors file: {}", filename);
-                Ok((filename.to_string(), tensor_info))
+                Ok((filename.to_string(), file_specific_info))
             }
             Err(e) => {
                 let error_msg = format!(
@@ -335,21 +422,31 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_upload_safetensors_success() {
-        // Create a minimal valid safetensors file (empty metadata, no tensors)
-        // More complex tensor data could be added here if needed.
-        let empty_tensors: HashMap<String, safetensors::tensor::TensorView> = HashMap::new();
-        let safetensor_bytes = serialize(&empty_tensors, &None).expect("Failed to serialize empty safetensors");
+        // Create a safetensors file with one tensor
+        let mut tensors_map = HashMap::new();
+        let tensor_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let tensor_view = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::F32,
+            vec![2, 2],
+            bytemuck::bytes_of_slice(&tensor_data),
+        ).unwrap();
+        tensors_map.insert("weight1".to_string(), tensor_view);
 
-        let payload = create_multipart_payload("dummy.safetensors", safetensor_bytes);
+        let safetensor_bytes = serialize(&tensors_map, &None)
+            .expect("Failed to serialize tensor for test");
 
+        let payload = create_multipart_payload("test.safetensors", safetensor_bytes);
         let resp = upload_files(payload).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = test::body_to_bytes(resp.into_body()).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
-        assert!(body_str.contains("<h3>dummy.safetensors</h3>"));
-        // Check for "<ul></ul>" as there are no tensors, or specific tensor info if you add some
-        assert!(body_str.contains("<ul></ul>"));
+
+        assert!(body_str.contains("<h3>test.safetensors</h3>"));
+        assert!(body_str.contains("<ul>"));
+        let expected_li = "<li data-dtype=\"F32\" data-preview=\"[1.0000, 2.0000, 3.0000, 4.0000]\" data-shape=\"[2, 2]\">weight1: [2, 2]</li>";
+        assert!(body_str.contains(expected_li), "Generated HTML: {}", body_str);
+        assert!(body_str.contains("</ul>"));
     }
 
     #[actix_rt::test]
@@ -434,8 +531,17 @@ mod tests {
      #[actix_rt::test]
     async fn test_upload_multiple_valid_files() {
         let tokenizer_content = r#"{"name": "multi_tokenizer"}"#.as_bytes().to_vec();
-        let empty_tensors: HashMap<String, safetensors::tensor::TensorView> = HashMap::new();
-        let safetensor_bytes = serialize(&empty_tensors, &None).expect("Failed to serialize empty safetensors");
+
+        let mut sf_tensors_map = HashMap::new();
+        let sf_tensor_data: Vec<i64> = vec![100, 200, 300];
+        let sf_tensor_view = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::I64,
+            vec![3],
+            bytemuck::bytes_of_slice(&sf_tensor_data),
+        ).unwrap();
+        sf_tensors_map.insert("data_tensor".to_string(), sf_tensor_view);
+        let safetensor_bytes = serialize(&sf_tensors_map, &None)
+            .expect("Failed to serialize tensor for multi-file test");
 
         let files = vec![
             ("good_tokenizer.json", tokenizer_content),
@@ -450,9 +556,13 @@ mod tests {
         let body_str = std::str::from_utf8(&body).unwrap();
 
         assert!(body_str.contains("<h2>Uploaded File Information:</h2>"));
+        // Check tokenizer file part
         assert!(body_str.contains("<h3>good_tokenizer.json</h3>"));
         assert!(body_str.contains(r#"name&quot;: &quot;multi_tokenizer&quot;"#));
+
+        // Check safetensor file part
         assert!(body_str.contains("<h3>good.safetensors</h3>"));
-        assert!(body_str.contains("<ul></ul>")); // For empty safetensor
+        let expected_sf_li = "<li data-dtype=\"I64\" data-preview=\"[100, 200, 300]\" data-shape=\"[3]\">data_tensor: [3]</li>";
+        assert!(body_str.contains(expected_sf_li), "Generated HTML for safetensor in multi-upload: {}", body_str);
     }
 }
