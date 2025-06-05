@@ -857,6 +857,77 @@ impl GPT2Model {
 
         Ok(logits)
     }
+
+    /// Forward pass returning logits and the final hidden representation.
+    pub fn forward_with_hidden(
+        &self,
+        token_ids: &Tensor<u32>,
+        mask: Option<&Tensor<f32>>,
+        theta_hat: Option<f32>,
+        _model_cache: Option<&mut ModelKVCache>,
+    ) -> Result<(Tensor<f32>, Tensor<f32>), TransformerError> {
+        let current_seq_len = token_ids.shape[1];
+
+        if current_seq_len > self.config.block_size {
+            return Err(TransformerError::ConfigError(format!(
+                "Input sequence length {} exceeds model block size {}",
+                current_seq_len, self.config.block_size
+            )));
+        }
+
+        let token_embed = tensor_ops::embedding(token_ids, &self.wte)?;
+
+        let past_seq_len = 0;
+        let pos_ids_data: Vec<u32> = (past_seq_len..past_seq_len + current_seq_len)
+            .map(|p| p as u32)
+            .collect();
+        let pos_ids_tensor = Tensor::new(pos_ids_data, vec![current_seq_len])?;
+        let mut pos_embed_reshaped = tensor_ops::embedding(&pos_ids_tensor, &self.wpe)?;
+        if pos_embed_reshaped.rank() == 2 && token_embed.rank() == 3 {
+            if pos_embed_reshaped.shape[0] == token_embed.shape[1]
+                && pos_embed_reshaped.shape[1] == token_embed.shape[2]
+            {
+                let new_shape_for_pos = vec![1, pos_embed_reshaped.shape[0], pos_embed_reshaped.shape[1]];
+                pos_embed_reshaped = pos_embed_reshaped.reshape(new_shape_for_pos)?;
+            }
+        }
+        let mut x_data = token_embed.data.clone();
+        if pos_embed_reshaped.shape[0] == 1 {
+            let s = token_embed.shape[1];
+            let e = token_embed.shape[2];
+            for b_idx in 0..token_embed.shape[0] {
+                for s_idx in 0..s {
+                    for e_idx in 0..e {
+                        x_data[b_idx * s * e + s_idx * e + e_idx] +=
+                            pos_embed_reshaped.data[s_idx * e + e_idx];
+                    }
+                }
+            }
+        }
+        let mut x = Tensor::new(x_data, token_embed.shape.clone())?;
+
+        for block in &self.blocks {
+            x = block.forward(&x, mask, theta_hat, None)?;
+        }
+
+        x = tensor_ops::layernorm(&x, &self.ln_f_g, &self.ln_f_b, 1e-5)?;
+
+        let wte_t_data = Tensor::<f32>::transpose_data_generic(
+            &self.wte.data,
+            self.wte.shape[0],
+            self.wte.shape[1],
+        );
+        let wte_t = Tensor::new(wte_t_data, vec![self.config.n_embd, self.config.vocab_size])?;
+        let logits = tensor_ops::linear(&x, &wte_t, None)?;
+
+        Ok((logits, x))
+    }
+
+    pub fn apply_wte_gradient(&mut self, grad: &[f32], lr: f32) {
+        for (w, g) in self.wte.data.iter_mut().zip(grad.iter()) {
+            *w -= lr * g;
+        }
+    }
 }
 
 trait TensorExtMHA {
