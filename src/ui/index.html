@@ -47,6 +47,73 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+
+        /* Modal Styles */
+        /* The #tensorModal.modal class from Pico should handle basic modal layout.
+           These styles ensure it's a full overlay and provide some content styling. */
+        #tensorModal {
+          position: fixed; /* Stay in place */
+          z-index: 1000; /* Sit on top - Pico uses high z-indexes for modals too */
+          left: 0;
+          top: 0;
+          width: 100%; /* Full width */
+          height: 100%; /* Full height */
+          overflow: auto; /* Enable scroll if needed for the modal itself */
+          background-color: rgba(0,0,0,0.4); /* Black w/ opacity for backdrop */
+          /* display: none; is handled by inline style initially and JS */
+        }
+
+        /* PicoCSS styles 'article' within '.modal' for the modal dialog box.
+           We can adjust its default behavior if needed. */
+        #tensorModal article {
+          margin: 10% auto; /* More top margin for better centering */
+          padding: 20px;   /* Default Pico padding might be sufficient, this ensures it */
+          max-width: 700px; /* Increased max-width for potentially wider content */
+          border-radius: 8px; /* Optional: ensure rounded corners if not default */
+        }
+
+        #tensorModal article header {
+            display: flex; /* Allows aligning title and close button */
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        #tensorModalContent h4 { /* Tensor Name */
+          margin-top: 0; /* Remove default top margin if it's the first element */
+          margin-bottom: 1rem;
+          font-size: 1.5rem; /* Larger tensor name */
+        }
+
+        #tensorModalContent p {
+          margin-bottom: 0.75rem; /* Consistent spacing for p tags */
+          font-size: 1rem;
+        }
+        #tensorModalContent p strong {
+            color: var(--pico-secondary-foreground); /* Use Pico variable for emphasis */
+        }
+
+        #tensorModalContent pre { /* For data preview */
+          background-color: var(--pico-code-background); /* Use Pico variable */
+          border: 1px solid var(--pico-form-field-border-color); /* Use Pico variable */
+          padding: 15px; /* More padding */
+          overflow-x: auto; /* Allow horizontal scroll for long previews */
+          white-space: pre-wrap; /* Wrap lines but preserve formatting */
+          word-wrap: break-word; /* Break long words if necessary */
+          border-radius: 4px;
+          max-height: 200px; /* Limit height and make scrollable if preview is very long */
+          font-size: 0.9em;
+        }
+
+        /* Ensure close button is styled nicely by Pico.
+           The .close class from Pico should handle most of it.
+           We can add custom styles if needed for better positioning or appearance if it's not part of a <header>.
+           Pico's default .close is typically for <dialog> or specific components.
+           If the <a> tag with class "close" isn't styled as expected, we might need this: */
+        #tensorModalCloseButton {
+            text-decoration: none;
+            font-size: 1.5rem; /* Make it a bit larger if needed */
+            /* Pico's default .close styling might already be good. */
+        }
     </style>
 </head>
 <body>
@@ -67,6 +134,20 @@
         <div id="uploadResults" class="results-container" aria-live="polite">
             <!-- Server response will be displayed here -->
         </div>
+
+        <!-- Placeholder for Tensor Details Modal -->
+        <div id="tensorModal" class="modal" style="display:none;">
+            <article>
+                <header>
+                    <!-- Added an ID for easier selection -->
+                    <a href="#close" aria-label="Close" class="close" id="tensorModalCloseButton"></a>
+                    Tensor Details
+                </header>
+                <div id="tensorModalContent">
+                    <!-- Details will be populated here by JavaScript -->
+                </div>
+            </article>
+        </div>
     </main>
 
     <script>
@@ -76,6 +157,9 @@
         const dropZone = document.getElementById('dropZone');   // Visible drop zone area
         const responseDisplay = document.getElementById('uploadResults'); // Div to show server responses
         const uploadButton = document.getElementById('uploadButton'); // Submit button
+        const tensorModal = document.getElementById('tensorModal'); // Modal element
+        const tensorModalContent = document.getElementById('tensorModalContent'); // Modal content area
+        const tensorModalCloseButton = document.getElementById('tensorModalCloseButton'); // Modal close button
 
         // --- Helper Functions ---
         function updateDropZoneText(files) {
@@ -157,6 +241,9 @@
                 // Display the server's HTML response (could be success info or error details)
                 responseDisplay.innerHTML = htmlData;
 
+                // After response is inserted, make tensor items clickable
+                attachTensorClickListeners();
+
                 if (!response.ok) {
                     // Log a warning if the server response was not OK (e.g., 400, 500)
                     // The displayed `htmlData` should already contain the server-formatted error.
@@ -174,6 +261,71 @@
             }
         }
         uploadForm.addEventListener('submit', handleFormSubmit);
+
+        // --- Tensor Click Handling ---
+        function showTensorDetails(name, shape, dtype, preview) {
+            // For now, just log the details.
+            // In the next step, this will populate and show the modal.
+            console.log("Tensor Clicked:");
+            console.log("  Name:", name);
+            console.log("  Shape:", shape);
+            console.log("  DType:", dtype);
+            console.log("  Preview:", preview);
+
+            // Populate modal content
+            tensorModalContent.innerHTML = `
+                <h4>${name}</h4>
+                <p><strong>Shape:</strong> ${shape}</p>
+                <p><strong>Data Type:</strong> ${dtype}</p>
+                <p><strong>Preview:</strong></p>
+                <pre>${preview}</pre>
+            `;
+            // Display the modal
+            tensorModal.style.display = 'block';
+            // For PicoCSS, if using <dialog>, it would be: tensorModal.showModal(); or tensorModal.open = true;
+            // Since it's a div styled as modal, direct style change is fine.
+        }
+
+        function attachTensorClickListeners() {
+            const tensorListItems = responseDisplay.querySelectorAll('li[data-dtype]');
+            tensorListItems.forEach(li => {
+                // Make the tensor name part clickable by wrapping it, or making the whole li clickable
+                // For simplicity, let's make the whole li clickable.
+                li.style.cursor = 'pointer';
+                li.addEventListener('click', function(event) {
+                    event.preventDefault(); // If we wrap in <a> later
+
+                    const name = this.textContent.split(':')[0].trim(); // Extract name from "Name: [shape]"
+                    const shape = this.dataset.shape;
+                    const dtype = this.dataset.dtype;
+                    const preview = this.dataset.preview;
+
+                    showTensorDetails(name, shape, dtype, preview);
+                });
+            });
+        }
+
+        // --- Modal Close Functionality ---
+        tensorModalCloseButton.addEventListener('click', (event) => {
+            event.preventDefault();
+            tensorModal.style.display = 'none';
+        });
+
+        // Optional: Close modal if user clicks outside the modal content (on the backdrop)
+        // This requires the .modal class to be a full-screen overlay for this to work effectively.
+        // PicoCSS default modal might not behave like this out of the box if it's not a <dialog>.
+        tensorModal.addEventListener('click', (event) => {
+            if (event.target === tensorModal) { // Check if the click is directly on the modal backdrop
+                tensorModal.style.display = 'none';
+            }
+        });
+
+        // Optional: Close modal with Escape key
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && tensorModal.style.display === 'block') {
+                tensorModal.style.display = 'none';
+            }
+        });
     </script>
 </body>
 </html>

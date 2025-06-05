@@ -19,6 +19,8 @@ libm = "0.2.8" # For math functions like tanhf in GELU
 uuid = { version = "1.7.0", features = ["v4"] }
 actix-web = "4"
 actix-files = "0.6"
+bytemuck = { version = "1.14.0", features = ["derive"] }
+html-escape = "0.2.13"
 
 [features]
 default = ["ndarray_backend"]

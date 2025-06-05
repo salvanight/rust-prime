@@ -157,12 +157,13 @@ As part of the experimental `ndarray`-based library, a web-based UI is available
     (or `./target/debug/native_cli` for a debug build).
 
     When the `native_cli` starts with the UI enabled (current default), it will launch the web server.
+    You can specify a custom port using the `--port` or `-p` option:
+    ```bash
+    ./target/release/native_cli --port 8081
+    ```
 
 3.  **Access the UI**:
-    Open your web browser and navigate to:
-    [http://127.0.0.1:8080](http://127.0.0.1:8080)
-
-    The port `8080` is currently hardcoded in the application.
+    Open your web browser and navigate to the address shown in the console (default is [http://127.0.0.1:8080](http://127.0.0.1:8080), or your custom port if specified).
 
 ### UI Features
 
