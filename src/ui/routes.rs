@@ -4,6 +4,8 @@
 //! uploading and inspection user interface. It includes routes to serve the main
 //! HTML page and to handle file uploads.
 
+const VOCAB_PREVIEW_COUNT: usize = 30;
+
 use actix_web::{web, App, HttpServer, Responder, HttpResponse, Error};
 use actix_files::NamedFile;
 use std::path::PathBuf; // Though PathBuf is imported, it's not explicitly used in the provided snippet. Will keep for now.
@@ -176,11 +178,13 @@ pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error>
                 }
                 error_html_response.push_str("</ul>");
             } else if info.get("_type").map_or(false, |t| t == "tokenizer") {
-                error_html_response.push_str("<pre>");
-                for (key, value) in info {
-                    if key == "content_preview" {
-                        error_html_response.push_str(&value.escape_default().to_string());
-                    }
+                let mut pre_attributes = String::new();
+                if let Some(vocab_json) = info.get("vocab_preview_json") {
+                    pre_attributes.push_str(&format!(" data-vocab-preview='{}'", html_escape::encode_double_quoted_attribute(vocab_json)));
+                }
+                error_html_response.push_str(&format!("<pre{}>", pre_attributes));
+                if let Some(content_preview) = info.get("content_preview") {
+                    error_html_response.push_str(&content_preview.escape_default().to_string());
                 }
                 error_html_response.push_str("</pre>");
             }
@@ -230,11 +234,13 @@ pub async fn upload_files(mut payload: Multipart) -> Result<HttpResponse, Error>
                 }
                 html_response.push_str("</ul>");
             } else if info.get("_type").map_or(false, |t| t == "tokenizer") {
-                html_response.push_str("<pre>");
-                for (key, value) in info {
-                    if key == "content_preview" {
-                         html_response.push_str(&value.escape_default().to_string());
-                    }
+                let mut pre_attributes = String::new();
+                if let Some(vocab_json) = info.get("vocab_preview_json") {
+                    pre_attributes.push_str(&format!(" data-vocab-preview='{}'", html_escape::encode_double_quoted_attribute(vocab_json)));
+                }
+                html_response.push_str(&format!("<pre{}>", pre_attributes));
+                if let Some(content_preview) = info.get("content_preview") {
+                    html_response.push_str(&content_preview.escape_default().to_string());
                 }
                 html_response.push_str("</pre>");
             }
@@ -345,7 +351,32 @@ async fn process_single_file(
             Ok(json_value) => {
                 let mut tokenizer_details = HashMap::new();
                 tokenizer_details.insert("content_preview".to_string(), format!("{:.200}", json_value.to_string()));
-                tokenizer_details.insert("_type".to_string(), "tokenizer".to_string()); // For HTML generation
+                tokenizer_details.insert("_type".to_string(), "tokenizer".to_string());
+
+                // Extract vocabulary preview
+                if let Some(model) = json_value.get("model") {
+                    if let Some(vocab_value) = model.get("vocab") {
+                        if let Some(vocab_map) = vocab_value.as_object() {
+                            let mut vocab_vec: Vec<(String, u32)> = vocab_map
+                                .iter()
+                                .filter_map(|(token, id_val)| {
+                                    id_val.as_u64().map(|id| (token.clone(), id as u32))
+                                })
+                                .collect();
+
+                            vocab_vec.sort_by_key(|&(_, id)| id); // Sort by ID
+
+                            let vocab_preview_slice = vocab_vec
+                                .into_iter()
+                                .take(VOCAB_PREVIEW_COUNT)
+                                .collect::<Vec<(String, u32)>>();
+
+                            if let Ok(serialized_vocab_preview) = serde_json::to_string(&vocab_preview_slice) {
+                                tokenizer_details.insert("vocab_preview_json".to_string(), serialized_vocab_preview);
+                            }
+                        }
+                    }
+                }
                 println!("Successfully processed tokenizer.json file: {}", filename);
                 Ok((filename.to_string(), tokenizer_details))
             }
@@ -418,17 +449,99 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_upload_tokenizer_json_success() {
-        let tokenizer_content = r#"{"name": "test_tokenizer"}"#.as_bytes().to_vec();
-        let payload = create_multipart_payload("tokenizer.json", tokenizer_content);
+        let tokenizer_json_content = r#"{
+            "name": "test_tokenizer",
+            "model": {
+                "vocab": {
+                    "<s>": 0,
+                    "<pad>": 1,
+                    "</s>": 2,
+                    "a": 3,
+                    "b": 4
+                }
+            }
+        }"#;
+        let payload = create_multipart_payload("tokenizer.json", tokenizer_json_content.as_bytes().to_vec());
 
         let resp = upload_files(payload).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = test::body_to_bytes(resp.into_body()).await.unwrap();
         let body_str = std::str::from_utf8(&body).unwrap();
+
         assert!(body_str.contains("<h3>tokenizer.json</h3>"));
-        assert!(body_str.contains(r#"name&quot;: &quot;test_tokenizer&quot;"#));
+        assert!(body_str.contains("test_tokenizer")); // Check for part of the content preview
+
+        // Check for data-vocab-preview attribute on the <pre> tag
+        let expected_vocab_preview_data = vec![
+            ("<s>".to_string(), 0u32),
+            ("<pad>".to_string(), 1u32),
+            ("</s>".to_string(), 2u32),
+            ("a".to_string(), 3u32),
+            ("b".to_string(), 4u32),
+        ];
+        let expected_vocab_json_string = serde_json::to_string(&expected_vocab_preview_data).unwrap();
+        let expected_attribute_string = format!("data-vocab-preview='{}'", html_escape::encode_double_quoted_attribute(&expected_vocab_json_string));
+
+        assert!(body_str.contains(&expected_attribute_string), "Expected vocab preview attribute not found or incorrect. Body: {}", body_str);
     }
+
+    #[actix_rt::test]
+    async fn test_upload_tokenizer_json_success_empty_vocab() {
+        let tokenizer_json_content = r#"{"name": "test_tokenizer_no_vocab", "model": {}}"#;
+        let payload = create_multipart_payload("tokenizer_no_vocab.json", tokenizer_json_content.as_bytes().to_vec());
+
+        let resp = upload_files(payload).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = test::body_to_bytes(resp.into_body()).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        assert!(body_str.contains("<h3>tokenizer_no_vocab.json</h3>"));
+        assert!(!body_str.contains("data-vocab-preview="), "data-vocab-preview should not be present for empty/missing vocab. Body: {}", body_str);
+    }
+
+    #[actix_rt::test]
+    async fn test_upload_tokenizer_json_success_many_vocab_truncated() {
+        let mut vocab_map_str = String::from("{");
+        for i in 0..(VOCAB_PREVIEW_COUNT + 5) {
+            vocab_map_str.push_str(&format!("\"token{}\": {},", i, i));
+        }
+        vocab_map_str.pop(); // Remove last comma
+        vocab_map_str.push('}');
+        let tokenizer_json_content = format!(r#"{{
+            "name": "test_tokenizer_many_vocab",
+            "model": {{ "vocab": {} }}
+        }}"#, vocab_map_str);
+
+        let payload = create_multipart_payload("tokenizer_many_vocab.json", tokenizer_json_content.as_bytes().to_vec());
+        let resp = upload_files(payload).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = test::body_to_bytes(resp.into_body()).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        assert!(body_str.contains("<h3>tokenizer_many_vocab.json</h3>"));
+
+        let data_attr_start = "data-vocab-preview='";
+        let data_attr_end = "']"; // End of the JSON array within the attribute
+        if let Some(start_idx) = body_str.find(data_attr_start) {
+            let actual_attr_val_with_end = &body_str[start_idx + data_attr_start.len()..];
+            if let Some(end_idx) = actual_attr_val_with_end.find(data_attr_end) {
+                 let actual_json_str = &actual_attr_val_with_end[..end_idx + 1]; // Include the closing bracket
+                 let parsed_vocab: Vec<(String, u32)> = serde_json::from_str(actual_json_str).expect("Failed to parse vocab preview from HTML attribute");
+                 assert_eq!(parsed_vocab.len(), VOCAB_PREVIEW_COUNT, "Vocabulary preview should be truncated to VOCAB_PREVIEW_COUNT");
+                 for i in 0..VOCAB_PREVIEW_COUNT {
+                     assert_eq!(parsed_vocab[i].0, format!("token{}", i));
+                     assert_eq!(parsed_vocab[i].1, i as u32);
+                 }
+            } else {
+                panic!("Could not find end of data-vocab-preview attribute value. Body: {}", body_str);
+            }
+        } else {
+            panic!("data-vocab-preview attribute not found. Body: {}", body_str);
+        }
+    }
+
 
     #[actix_rt::test]
     async fn test_upload_safetensors_success() {
