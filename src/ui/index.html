@@ -115,31 +115,49 @@
             /* Pico's default .close styling might already be good. */
         }
 
+            /* Pico's default .close styling might already be good. */
+        }
+
         /* Comparison Modal Specific Styles */
         #comparisonModal article {
           max-width: 900px; /* Wider for two columns */
-          /* Inherits other modal article styles from #tensorModal article if not overridden by Pico's .modal > article */
         }
 
         #comparisonGrid {
-          display: grid; /* Ensure grid behavior if not automatically applied by class alone */
-          grid-template-columns: 1fr 1fr; /* Two equal columns */
-          gap: var(--pico-spacing, 1rem); /* Spacing between columns */
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: var(--pico-spacing, 1rem);
         }
 
         #tensorAComparisonArea, #tensorBComparisonArea {
             border: 1px solid var(--pico-form-field-border-color, #ddd);
             padding: var(--pico-spacing, 1rem);
             border-radius: var(--pico-border-radius, 0.25rem);
+            background-color: var(--pico-card-background-color); /* Align with card background */
         }
 
         #tensorAComparisonArea h4, #tensorBComparisonArea h4 {
-            margin-top: 0; /* Remove default top margin for headings in these areas */
+            margin-top: 0;
+            font-size: 1.2rem; /* Slightly smaller than modal title */
+            border-bottom: 1px solid var(--pico-muted-border-color);
+            padding-bottom: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        #comparisonResultArea {
+            margin-top: var(--pico-spacing, 1rem);
+            padding: var(--pico-spacing, 1rem);
+            border: 1px solid var(--pico-form-field-border-color, #ddd);
+            border-radius: var(--pico-border-radius, 0.25rem);
+            background-color: var(--pico-card-background-color);
         }
 
         #comparisonResultArea h4 {
-          margin-top: var(--pico-spacing, 1rem);
-          margin-bottom: 0.5rem;
+          margin-top: 0;
+          margin-bottom: 0.75rem;
+          font-size: 1.2rem;
+           border-bottom: 1px solid var(--pico-muted-border-color);
+            padding-bottom: 0.5rem;
         }
 
         /* Ensure consistent styling for <pre> tags in comparison view */
@@ -152,9 +170,39 @@
           overflow-x: auto;
           white-space: pre-wrap;
           word-wrap: break-word;
-          max-height: 150px; /* Shorter for side-by-side previews */
+          max-height: 150px;
           font-size: 0.9em;
           border-radius: var(--pico-border-radius, 0.25rem);
+        }
+
+        /* Vocabulary Preview Styling */
+        .vocab-preview-container {
+            margin-top: 1rem;
+            padding: 0.75rem;
+            border: 1px solid var(--pico-muted-border-color);
+            border-radius: var(--pico-border-radius);
+            background-color: var(--pico-card-sectionning-background-color); /* Slightly different background */
+        }
+        .vocab-preview-container h4 {
+            font-size: 1rem;
+            margin-top: 0;
+            margin-bottom: 0.5rem;
+        }
+        .vocab-preview-container ul {
+            list-style-type: none;
+            padding-left: 0;
+            margin-bottom: 0;
+            max-height: 180px; /* Scrollable list for vocab */
+            overflow-y: auto;
+            font-size: 0.85em;
+        }
+        .vocab-preview-container ul li {
+            padding: 0.15rem 0;
+        }
+        .vocab-preview-container ul li code {
+            background-color: var(--pico-code-background);
+            padding: 0.1em 0.3em;
+            border-radius: var(--pico-border-radius);
         }
     </style>
 </head>
@@ -242,9 +290,18 @@
         const analysisContent = document.getElementById('analysisContent'); // Area for comparison results
 
         // --- Helper Functions ---
+        function escapeHtml(unsafe) {
+            return unsafe
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+
         function updateDropZoneText(files) {
             if (files && files.length > 0) {
-                let fileNames = Array.from(files).map(file => file.name).join(', ');
+                let fileNames = Array.from(files).map(file => escapeHtml(file.name)).join(', ');
                 dropZone.innerHTML = `<p>Selected: ${fileNames}. Click Upload or drop more files.</p>`;
             } else {
                 dropZone.innerHTML = `<p>Drag and drop files here, or click to select files.</p>`;
@@ -353,10 +410,13 @@
             console.log("  Preview:", preview);
 
             // Populate modal content
+            // Note: preview is already HTML-escaped by the backend for the data-attribute.
+            // Name, shape, dtype are also from data attributes or text content derived from server.
+            // If these could contain HTML special chars and weren't already handled, escapeHtml() would be needed here.
             tensorModalContent.innerHTML = `
-                <h4>${name}</h4>
-                <p><strong>Shape:</strong> ${shape}</p>
-                <p><strong>Data Type:</strong> ${dtype}</p>
+                <h4>${escapeHtml(name)}</h4>
+                <p><strong>Shape:</strong> ${escapeHtml(shape)}</p>
+                <p><strong>Data Type:</strong> ${escapeHtml(dtype)}</p>
                 <p><strong>Preview:</strong></p>
                 <pre>${preview}</pre>
             `;
@@ -418,6 +478,37 @@
         function setupTensorInteraction() {
             attachTensorClickListeners();
             attachCheckboxListeners();
+            displayVocabularyPreviews(); // Call the new function here
+        }
+
+        // --- Vocabulary Preview Display ---
+        function displayVocabularyPreviews() {
+            const tokenizerPreElements = responseDisplay.querySelectorAll('pre[data-vocab-preview]');
+            tokenizerPreElements.forEach(preElement => {
+                const vocabJsonString = preElement.dataset.vocabPreview;
+                if (vocabJsonString) {
+                    try {
+                        const parsedVocab = JSON.parse(vocabJsonString);
+                        if (Array.isArray(parsedVocab) && parsedVocab.length > 0) {
+                            let vocabHtml = `<div class="vocab-preview-container" style="margin-top: 1rem;"><h4>Vocabulary Preview (First ${parsedVocab.length} tokens):</h4><ul>`;
+                            parsedVocab.forEach(item => {
+                                // Ensure item is an array with two elements [token, id]
+                                if (Array.isArray(item) && item.length === 2) {
+                                    const token = item[0];
+                                    const id = item[1];
+                                    vocabHtml += `<li>Token: <code>${escapeHtml(String(token))}</code>, ID: ${id}</li>`;
+                                }
+                            });
+                            vocabHtml += '</ul></div>';
+                            preElement.insertAdjacentHTML('afterend', vocabHtml);
+                        }
+                    } catch (error) {
+                        console.error("Failed to parse vocab preview JSON:", error, "JSON string:", vocabJsonString);
+                        // Optionally, display a small error message next to the pre element
+                        // preElement.insertAdjacentHTML('afterend', '<p><small>Could not load vocabulary preview.</small></p>');
+                    }
+                }
+            });
         }
 
         // --- Modal Close Functionality ---
@@ -505,19 +596,20 @@
             }
 
             // Populate Tensor A & B details
+            // As with single tensor view, preview is pre-escaped. Other fields should be escaped.
             tensorAContent.innerHTML = `
-                <p><strong>Name:</strong> ${tensorAData.name}</p>
-                <p><strong>File:</strong> ${tensorAData.filename}</p>
-                <p><strong>Shape:</strong> ${tensorAData.shape}</p>
-                <p><strong>Data Type:</strong> ${tensorAData.dtype}</p>
+                <p><strong>Name:</strong> ${escapeHtml(tensorAData.name)}</p>
+                <p><strong>File:</strong> ${escapeHtml(tensorAData.filename)}</p>
+                <p><strong>Shape:</strong> ${escapeHtml(tensorAData.shape)}</p>
+                <p><strong>Data Type:</strong> ${escapeHtml(tensorAData.dtype)}</p>
                 <p><strong>Preview:</strong></p>
                 <pre>${tensorAData.preview}</pre>
             `;
             tensorBContent.innerHTML = `
-                <p><strong>Name:</strong> ${tensorBData.name}</p>
-                <p><strong>File:</strong> ${tensorBData.filename}</p>
-                <p><strong>Shape:</strong> ${tensorBData.shape}</p>
-                <p><strong>Data Type:</strong> ${tensorBData.dtype}</p>
+                <p><strong>Name:</strong> ${escapeHtml(tensorBData.name)}</p>
+                <p><strong>File:</strong> ${escapeHtml(tensorBData.filename)}</p>
+                <p><strong>Shape:</strong> ${escapeHtml(tensorBData.shape)}</p>
+                <p><strong>Data Type:</strong> ${escapeHtml(tensorBData.dtype)}</p>
                 <p><strong>Preview:</strong></p>
                 <pre>${tensorBData.preview}</pre>
             `;
@@ -539,34 +631,46 @@
                 if (previewA.length > 0 && previewB.length > 0) {
                     let differences = [];
                     let maxLength = Math.max(previewA.length, previewB.length);
-                    let previewsMatch = true;
-                    for (let i = 0; i < maxLength; i++) {
+                    let previewsMatch = true; // Assume match until proven otherwise or limited by length
+
+                    // Determine common length for direct comparison
+                    let commonLength = Math.min(previewA.length, previewB.length);
+
+                    for (let i = 0; i < commonLength; i++) {
                         const valA = previewA[i];
                         const valB = previewB[i];
-                        if (valA !== undefined && valB !== undefined) {
-                            differences.push((valA - valB).toPrecision(4));
-                            if (Math.abs(valA - valB) > 1e-6) previewsMatch = false; // Tolerance for float comparison
-                        } else {
-                            differences.push('N/A'); // Element exists in one but not the other
+                        differences.push((valA - valB).toPrecision(4));
+                        if (Math.abs(valA - valB) > 1e-6) { // Tolerance for float comparison
                             previewsMatch = false;
                         }
                     }
-                    analysisHTML += `<p><strong>Preview Differences (A - B):</strong> <pre>[${differences.join(', ')}]</pre></p>`;
+
+                    // If lengths are different, mark as not fully matching and add N/A for remaining elements
+                    if (previewA.length !== previewB.length) {
+                        previewsMatch = false;
+                        for (let i = commonLength; i < maxLength; i++) {
+                            differences.push('N/A');
+                        }
+                    }
+
+                    analysisHTML += `<p><strong>Preview Differences (A - B):</strong> <pre>[${escapeHtml(differences.join(', '))}]</pre></p>`;
+
                     if (previewsMatch && !(tensorAData.preview.includes("...") || tensorBData.preview.includes("..."))) {
-                         analysisHTML += `<p>Previews are numerically identical.</p>`;
+                         analysisHTML += `<p>Previews are numerically identical based on available data.</p>`;
                     } else if (tensorAData.preview.includes("...") || tensorBData.preview.includes("...")) {
-                        analysisHTML += `<p>Note: Preview comparison is limited due to truncated data ("...").</p>`;
-                    } else {
-                        analysisHTML += `<p>Previews show numerical differences.</p>`;
+                        analysisHTML += `<p>Note: Preview comparison is limited due to truncated data ("..."). Differences shown are for available elements.</p>`;
+                    } else if (!previewsMatch) { // Different lengths or different values
+                        analysisHTML += `<p>Previews show numerical differences or have different lengths.</p>`;
                     }
                 } else {
                     analysisHTML += `<p>Preview data not available or empty for one or both tensors; cannot compare numerically.</p>`;
                 }
             } else {
+                 // This part is already fine, but ensure error messages are also escaped if they could contain user input (not the case here)
                  analysisHTML += `<p>Cannot perform numerical comparison due to incompatible shapes or data types.</p>`;
             }
 
-            analysisContent.innerHTML = analysisHTML;
+            analysisContent.innerHTML = analysisHTML; // analysisHTML is constructed with <p> and <pre> which are safe
             comparisonModal.style.display = 'block';
         });
     </script>
