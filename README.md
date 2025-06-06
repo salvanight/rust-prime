@@ -142,6 +142,7 @@ The **experimental library in the root `src/` directory** is at an earlier stage
 
 As part of the experimental `ndarray`-based library, a web-based UI is available for uploading and inspecting model and tokenizer files. This UI is served by modifying the `native_cli` binary.
 For a detailed breakdown of the UI features and their mapping to core application functions, please see the [UI Functionality Document](UI_FUNCTIONALITY.md).
+For an overview of the project's architecture, see the [Application Architecture Document](ARCHITECTURE.md).
 
 ### Running the UI
 
